@@ -35,11 +35,14 @@ DEFAULT_TIMEOUT = 600.0  # local models on CPU are slow; a scoring batch can tak
 
 
 def provider() -> str:
-    """``"openai"`` when a compatible endpoint is configured, else ``"gemini"``."""
+    """``"openai"`` when a compatible endpoint is configured without a Gemini key
+    (or when explicitly requested via ``LLM_PROVIDER``), else ``"gemini"``."""
     explicit = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
     if explicit in ("openai", "ollama", "local", "openai-compatible"):
         return "openai"
     if explicit == "gemini":
+        return "gemini"
+    if (os.environ.get("GEMINI_API_KEY") or "").strip():
         return "gemini"
     return "openai" if base_url() else "gemini"
 
@@ -52,8 +55,14 @@ def model_name() -> str:
     return (os.environ.get("LLM_MODEL") or "").strip() or DEFAULT_MODEL
 
 
+def configured() -> bool:
+    """True when an OpenAI-compatible server is configured and not disabled by ``LLM_PROVIDER=gemini``."""
+    explicit = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
+    return explicit != "gemini" and bool(base_url())
+
+
 def active() -> bool:
-    """True when the moment picker should call the OpenAI-compatible server."""
+    """True when the moment picker should call the OpenAI-compatible server as primary."""
     return provider() == "openai" and bool(base_url())
 
 

@@ -92,3 +92,43 @@ silently). Self-host `/api/process` then accepts a request without
 `X-Gemini-Key` and `/api/config.localLlm` tells the dashboard not to demand one.
 Frame-based stages (`layout_picker`, `screencast_layout`, `get_visual_clips`)
 stay on Gemini. Never wired in cloud mode: `BILLING_ENABLED` ignores it.
+
+## Smart clip boundaries (`clip_boundaries.py`)
+
+The detail pass's `start`/`end` are a proposal. With `CLIP_REFINE` on (the
+default; the generate page's "smart clip boundaries" switch sends
+`smart_boundaries=0` to turn it off for one job), each clip goes through three
+passes instead of the classic `snap_clip_to_words`:
+
+1. **Transcript** (`refine`, deterministic). Sentence ends come from terminal
+   punctuation, a segment end followed by a pause (WhisperX splits segments by
+   sentence), a long pause, a shorter pause where no punctuation is near
+   (whisper drops it in crosstalk), a capitalised word after a pause, and a
+   pause plain whisper folded into a stretched word. The start moves back to
+   its sentence's start (up to 10 s) or forward to the next one (up to 5 s);
+   the end moves forward to finish its sentence (up to 12 s) or back to the
+   last whole one. Then up to `CLIP_REFINE_PAD_START`/`_END` (2 s) of the
+   surrounding silence, never within 80 ms of another word. Band:
+   `CLIP_REFINE_MIN_SECONDS` (20, or the user's own min) to the job's max (60).
+   A clip is grown by whole sentences to reach the minimum but never cut to
+   reach it: one that cannot be made whole in the band is kept and flagged.
+2. **LLM review** (`review_flagged`, `CLIP_REFINE_LLM=off` to skip). Only for
+   clips still flagged `incomplete_sentence_*` or `missing_context`, six per
+   call, through the job's own provider (`_run_gemini_stage`). The model picks
+   sentence **ids** from a numbered list; every time comes from the
+   transcript, and an id outside the list or a span outside the band is
+   ignored. A failed call never fails the job.
+3. **Audio** (`refine_clips_with_audio`, `CLIP_REFINE_AUDIO=0` to skip), run in
+   `main.py` once the source is local. `silencedetect` on the clip ±1 s, with
+   the threshold 16 dB under the region's mean volume (a fixed -35 dB found no
+   pause at all in ordinary recordings). Padded edges move into real pauses;
+   an edge with sound within 0.3 s of it is flagged `speech_cutoff_*`. No
+   pause anywhere (music bed) changes nothing.
+
+Each clip carries `boundaries`: `ai` (the model's range, also in `proposed`),
+`start`/`end` (what was cut), `speech`, `pad`, `reasons`, `warnings`
+(`incomplete_sentence_start|end`, `missing_context`, `too_short`,
+`excessive_silence`, `speech_cutoff_start|end`, `llm_incoherent`) and the
+config used. The result card and the clip editor show the AI and refined
+ranges; the editor's segments stay fully editable. Captions need nothing:
+they are built from absolute word times minus the clip start.

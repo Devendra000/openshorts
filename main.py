@@ -27,6 +27,7 @@ from google.genai import types as genai_types
 import frame_sampler
 import gpu_decode
 import gemini_worker
+import clip_boundaries
 import hook_grounding
 import layout_picker
 import llm_backend
@@ -2341,12 +2342,11 @@ def _run_gemini_stage(client, model_name, prompt, schema):
     """One schema-enforced model call with transient-error backoff.
     Returns (parsed_dict, cost_analysis).
 
-    With an OpenAI-compatible server configured (``llm_backend.active()``)
-    the call goes there instead of Gemini and ``client`` is unused; the
-    retry policy is shared because a local server has the same failure
-    shapes (connection refused while the model loads, a truncated body,
-    a 5xx from a busy vLLM)."""
-    use_local = llm_backend.active()
+    When ``client is None`` (``llm_backend.active()``), the call goes directly
+    to the OpenAI-compatible server. When Gemini is primary and fails to
+    respond after retries, falls back to the OpenAI-compatible server if one
+    is configured (``llm_backend.configured()``)."""
+    use_local = client is None or llm_backend.active()
     config = None if use_local else genai_types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=schema,
@@ -2386,6 +2386,9 @@ def _run_gemini_stage(client, model_name, prompt, schema):
                 'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
                 'validation error'))
             if attempt == max_attempts or not transient:
+                if not use_local and llm_backend.configured():
+                    print(f"⚠️ Gemini failed ({msg[:150]}), falling back to local LLM at {llm_backend.base_url()}...")
+                    return llm_backend.generate_json(prompt, schema, model=llm_backend.model_name())
                 raise
             wait = 5 * (2 ** (attempt - 1))
             who = "LLM server" if use_local else "Gemini"
@@ -2593,15 +2596,35 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             shorts = trim_to_best(shorts, max_clips)
             print(f"   Kept the {max_clips} best-scoring clip(s) of "
                   f"{max_clips + dropped}.")
-        # Snap each proposed clip onto real word boundaries (+ a bit of silence).
+        # Smart boundaries (clip_boundaries): whole sentences + ~2 s of
+        # breathing room; CLIP_REFINE=0 keeps the classic word snap.
+        refine_cfg = clip_boundaries.config_from_env()
+        rich_words = clip_boundaries.words_from_transcript(transcript_result, refine_cfg) \
+            if refine_cfg.enabled else []
         for s in shorts:
             # Keep the model's raw proposal: it is how boundary accuracy is
             # measured (distance to the nearest word before the snap; p90 was
             # 0.4-0.5 s on 8 talks, 21-sep-2026, so the snap reaches it).
             s["proposed"] = [s.get("start", 0), s.get("end", 0)]
+            if refine_cfg.enabled:
+                b = clip_boundaries.refine(s.get("start", 0), s.get("end", 0), rich_words,
+                                           video_duration, refine_cfg)
+                s["start"], s["end"], s["boundaries"] = b["start"], b["end"], b
+                continue
             ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
                                         min_duration=min_secs, max_duration=max_secs)
             s["start"], s["end"] = ns, ne
+            s["boundaries"] = clip_boundaries.disabled(s["proposed"][0], s["proposed"][1], (ns, ne))
+        if refine_cfg.enabled and refine_cfg.llm:
+            review_costs = clip_boundaries.review_flagged(
+                shorts, rich_words, video_duration, refine_cfg,
+                lambda prompt, schema: _run_gemini_stage(client, model_name, prompt, schema))
+            if review_costs:
+                print(f"   Reviewed the edges of flagged clips ({len(review_costs)} call(s)).")
+                costs.extend(review_costs)
+        if refine_cfg.enabled:
+            flagged = sum(1 for s in shorts if s["boundaries"].get("warnings"))
+            print(f"   Smart boundaries: {len(shorts)} clip(s) refined, {flagged} with warnings.")
         deduped = dedupe_overlapping(shorts)
         if len(deduped) < len(shorts):
             print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a "
@@ -3214,6 +3237,14 @@ if __name__ == '__main__':
                 "Clip detection failed — the AI model did not return usable clips for this video.")
         else:
             print(f"🔥 Found {len(clips_data['shorts'])} clips!")
+            if transcript is not None:
+                # Smart boundaries, audio pass: padded edges into real pauses,
+                # edges where the sound goes on are flagged (clip_boundaries).
+                try:
+                    clip_boundaries.refine_clips_with_audio(clips_data['shorts'], input_video,
+                                                            duration)
+                except Exception as e:
+                    print(f"   ⚠️ Boundary audio check skipped ({type(e).__name__}: {e})")
 
             # Save metadata. Silent videos have no transcript → no subtitles,
             # which is correct (there's no speech to caption).

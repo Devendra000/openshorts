@@ -95,7 +95,7 @@ function editorReducer(state, action) {
     }
 }
 
-export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRerendered }) {
+export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, onClose, onRerendered }) {
     const { refreshMe } = useAuth();
     const [edl, setEdl] = useState(null);
     const [loadError, setLoadError] = useState(null);
@@ -115,6 +115,12 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     const [renderError, setRenderError] = useState(null);
     const [confirmClose, setConfirmClose] = useState(false);
     const [selectedWord, setSelectedWord] = useState(null);
+    // Correcting a misheard word of the source transcript (keeps its timing).
+    const [wordDraft, setWordDraft] = useState(null); // null = not editing
+    const [wordSaving, setWordSaving] = useState(false);
+    const [wordError, setWordError] = useState(null);
+    // A word was fixed since the last render: the captions on screen are stale.
+    const [wordsFixed, setWordsFixed] = useState(false);
     const [playhead, setPlayhead] = useState(0);
     const [showSource, setShowSource] = useState(() => {
         try { return localStorage.getItem(HIDE_SOURCE_KEY) !== '1'; } catch { return true; }
@@ -215,8 +221,9 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     const dirty = useMemo(() => {
         if (!renderedSegments) return false;
         return JSON.stringify(segments) !== JSON.stringify(renderedSegments)
-            || framing !== renderedFraming;
-    }, [segments, renderedSegments, framing, renderedFraming]);
+            || framing !== renderedFraming
+            || (wordsFixed && reapplyCaptions);
+    }, [segments, renderedSegments, framing, renderedFraming, wordsFixed, reapplyCaptions]);
 
     // Trim bounds: with the source gone, cuts must stay inside the range the
     // canonical file was rendered from.
@@ -862,6 +869,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                 throw new Error(detail);
             }
             const data = await res.json();
+            if (reapplyCaptions) setWordsFixed(false);
             setRenderedSegments(data.recipe.segments.map((s) => ({ ...s })));
             setRenderedFraming(data.framing || 'auto');
             setFraming(data.framing || 'auto');
@@ -946,8 +954,41 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     // Stable identity keeps every untouched chunk out of the re-render.
     const pickWord = useCallback((w) => {
         setSelectedWord((prev) => (prev && prev.s === w.s && prev.e === w.e ? null : w));
+        setWordDraft(null);
+        setWordError(null);
         seekSource(w.s);
     }, [seekSource]);
+
+    // Fix what the selected word says in the job's source transcript. Its
+    // timestamps stay, so captions made from it stay on the audio, and every
+    // later recut / restyle / clip of this job picks the fix up.
+    const saveWordFix = async () => {
+        const text = (wordDraft || '').trim().replace(/\s+/g, ' ');
+        if (!selectedWord || !text) return;
+        if (text === selectedWord.w) { setWordDraft(null); return; }
+        setWordSaving(true);
+        setWordError(null);
+        try {
+            const data = await apiJson(`/api/job/${jobId}/transcript/word`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ start: selectedWord.s, end: selectedWord.e, text }),
+            });
+            const fixed = data.word;
+            setEdl((prev) => (prev ? {
+                ...prev,
+                words: prev.words.map((w) => (w.s === selectedWord.s && w.e === selectedWord.e
+                    ? { ...w, w: fixed.w } : w)),
+            } : prev));
+            setSelectedWord((prev) => (prev ? { ...prev, w: fixed.w } : prev));
+            setWordDraft(null);
+            setWordsFixed(true);
+        } catch (e) {
+            setWordError(e.message || 'could not save the word');
+        } finally {
+            setWordSaving(false);
+        }
+    };
 
     // ---- render -------------------------------------------------------------
     if (loadError) {
@@ -1099,6 +1140,13 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                     <p className="eyebrow mb-1">EDITOR · CLIP {clipIndex + 1}</p>
                     <h2 className="font-display lowercase text-xl sm:text-2xl text-ink truncate">edit clip</h2>
                     {clipTitle && <p className="text-xs text-muted truncate mt-0.5">{clipTitle}</p>}
+                    {/* Smart boundaries: the AI's own edges next to the refined ones
+                        the clip was cut on. The segments below stay fully editable. */}
+                    {boundaries?.refined && Array.isArray(boundaries.ai) && (
+                        <p className="readout mt-1 truncate" title={(boundaries.reasons || []).join('\n')}>
+                            AI {fmt(boundaries.ai[0])}–{fmt(boundaries.ai[1])} · REFINED {fmt(boundaries.start)}–{fmt(boundaries.end)}
+                        </p>
+                    )}
                     {/* Phone: the readouts move under the title — as a third
                         column they squeezed the title to two characters. */}
                     <p className="readout sm:hidden mt-1 truncate">
@@ -1230,8 +1278,47 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                                 {/* Boundary actions live HERE, above the words they
                                     act on, because this is where the eye is when
                                     picking a cut point from the text (issue #73). */}
-                                {selectedWord ? (
+                                {selectedWord && wordDraft !== null ? (
+                                    <form
+                                        className="flex items-center gap-1.5 shrink-0"
+                                        onSubmit={(e) => { e.preventDefault(); saveWordFix(); }}
+                                    >
+                                        <input
+                                            autoFocus
+                                            value={wordDraft}
+                                            maxLength={60}
+                                            onChange={(e) => setWordDraft(e.target.value)}
+                                            onKeyDown={(e) => {
+                                                // Escape cancels the edit, not the whole editor.
+                                                if (e.key === 'Escape') {
+                                                    e.preventDefault();
+                                                    e.stopPropagation();
+                                                    setWordDraft(null);
+                                                    setWordError(null);
+                                                }
+                                            }}
+                                            aria-label={`correct "${selectedWord.w}"`}
+                                            className="input-field text-xs py-1 px-2 w-40"
+                                        />
+                                        <button type="submit" disabled={wordSaving || !wordDraft.trim()}
+                                            className="btn-quiet text-[11px] py-1 px-2 disabled:opacity-40">
+                                            {wordSaving ? 'saving…' : 'save'}
+                                        </button>
+                                        <button type="button" onClick={() => { setWordDraft(null); setWordError(null); }}
+                                            className="btn-quiet text-[11px] py-1 px-2">
+                                            cancel
+                                        </button>
+                                        {wordError && <span className="text-[11px] text-red-400 lowercase">{wordError}</span>}
+                                    </form>
+                                ) : selectedWord ? (
                                     <div className="flex items-center gap-1.5 shrink-0">
+                                        <button
+                                            onClick={() => setWordDraft(selectedWord.w)}
+                                            title={`"${selectedWord.w}" is misheard? Correct the transcript; the timing stays`}
+                                            className="btn-quiet text-[11px] py-1 px-2"
+                                        >
+                                            fix word
+                                        </button>
                                         <button
                                             onClick={() => setSegment(selected, { start: selectedWord.s }, { snap: false })}
                                             title={`segment #${selected + 1} starts at "${selectedWord.w}" (${fmt(selectedWord.s)})`}
@@ -1247,8 +1334,10 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                                             #{selected + 1} ends here
                                         </button>
                                     </div>
+                                ) : wordsFixed && reapplyCaptions ? (
+                                    <span className="readout shrink-0">WORD FIXED · RE-RENDER TO UPDATE THE CAPTIONS</span>
                                 ) : words.length > 0 ? (
-                                    <span className="readout shrink-0">CLICK A WORD, THEN SET A BOUNDARY</span>
+                                    <span className="readout shrink-0">CLICK A WORD TO SET A BOUNDARY OR FIX IT</span>
                                 ) : null}
                             </div>
                             {words.length === 0 ? (

@@ -57,6 +57,11 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [autoHook, setAutoHook] = useState(() => {
         try { return localStorage.getItem('os_auto_hook') !== '0'; } catch { return true; }
     });
+    // Smart clip boundaries: whole sentences + ~2 s of padding on each side.
+    // On by default; turning it off sticks across sessions.
+    const [smartBoundaries, setSmartBoundaries] = useState(() => {
+        try { return localStorage.getItem('os_smart_boundaries') !== '0'; } catch { return true; }
+    });
     const [autoHookStyle, setAutoHookStyle] = useState(() => {
         // v2 key: the default became 'pill'; an old saved 'classic' was just the old default.
         try { return localStorage.getItem('os_auto_hook_style_v2') || 'pill'; } catch { return 'pill'; }
@@ -129,6 +134,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
             clipMaxSeconds: clipMaxSeconds || null,
             autoHook,
             autoHookStyle,
+            smartBoundaries,
             layout,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
@@ -137,6 +143,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
+            localStorage.setItem('os_smart_boundaries', smartBoundaries ? '1' : '0');
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
@@ -315,7 +322,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
                         advanced options
-                        {(targetClips || clipMinSeconds || clipMaxSeconds || !autoHook) && (
+                        {(targetClips || clipMinSeconds || clipMaxSeconds || !autoHook || !smartBoundaries) && (
                             <span className="text-brass">·</span>
                         )}
                     </button>
@@ -358,6 +365,22 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 material doesn't hold them. Leave blank to let it decide.
                                 {plan === 'free' && ` The free plan makes the ${FREE_CLIPS_PER_VIDEO} to ${FREE_CLIPS_QUIET} best clips of each video, fewer while its queue is busy; plans get every clip, up to ${MAX_CLIPS_PER_VIDEO}.`}
                             </p>
+                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
+                                <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
+                                    <input
+                                        type="checkbox"
+                                        checked={smartBoundaries}
+                                        onChange={(e) => setSmartBoundaries(e.target.checked)}
+                                        className="w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
+                                    />
+                                    smart clip boundaries
+                                </label>
+                                <p className="w-full text-[11px] leading-relaxed text-muted">
+                                    {smartBoundaries
+                                        ? 'Clips start and end on whole sentences, with about 2 s of room on each side. You can still trim every clip in the editor.'
+                                        : 'Clips keep the AI\'s own edges, snapped to the nearest word.'}
+                                </p>
+                            </div>
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
                                 <span className="text-xs text-ink2">vertical layout</span>
                                 <select

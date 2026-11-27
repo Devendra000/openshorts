@@ -19,6 +19,7 @@ def local(monkeypatch):
     monkeypatch.setenv("LLM_BASE_URL", "http://llm.test/v1")
     monkeypatch.setenv("LLM_MODEL", "qwen2.5:14b")
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
 
 def _serve(handler, monkeypatch):
@@ -53,6 +54,21 @@ def test_base_url_alone_activates_and_describes(local):
 def test_explicit_gemini_provider_wins_over_base_url(local, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     assert llm_backend.active() is False
+    assert llm_backend.configured() is False
+
+
+def test_gemini_key_takes_priority_over_base_url_with_fallback(local, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    assert llm_backend.provider() == "gemini"
+    assert llm_backend.active() is False
+    assert llm_backend.configured() is True
+
+
+def test_explicit_local_provider_wins_over_gemini_key(local, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    assert llm_backend.provider() == "openai"
+    assert llm_backend.active() is True
 
 
 # --- generate_json ---------------------------------------------------------
@@ -149,3 +165,28 @@ def test_score_batch_shrinks_for_local_models(local, monkeypatch):
     monkeypatch.delenv("LLM_BASE_URL")
     monkeypatch.delenv("LLM_SCORE_BATCH")
     assert main.score_batch_size() == 8
+
+
+def test_stage_falls_back_to_local_when_gemini_fails(local, monkeypatch):
+    main = pytest.importorskip("main")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(main.time, "sleep", lambda *_: None)
+
+    class FailingModels:
+        def generate_content(self, **_kwargs):
+            raise RuntimeError("503 UNAVAILABLE")
+
+    class FakeClient:
+        models = FailingModels()
+
+    seen = {}
+
+    def fake_generate(prompt, schema, model=None):
+        seen["model"] = model
+        return {"windows": [{"id": "w0", "start": 0, "end": 1, "score": 77, "reason": "ok"}]}, {"total_cost": 0.0, "local": True}
+
+    monkeypatch.setattr(llm_backend, "generate_json", fake_generate)
+    parsed, cost = main._run_gemini_stage(FakeClient(), "gemini-3.1-flash-lite", "prompt", gemini_worker.ScoreResponse)
+    assert seen["model"] == "qwen2.5:14b"
+    assert parsed["windows"][0]["score"] == 77
+    assert cost["local"] is True

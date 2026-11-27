@@ -311,3 +311,141 @@ class TestPerformRecut:
                 reframe=True, runner=self._touching_runner,
                 renderer=lambda *a: False)
         assert all(not f.startswith("temp_") for f in os.listdir(tmp_path))
+
+
+class TestPlanPieces:
+    def test_inside_one_base_is_one_file_piece(self):
+        pieces = recut.plan_pieces([_seg(12, 22)], [("c.mp4", [_seg(10, 40)])])
+        assert pieces == [{"path": "c.mp4", "start": 2.0, "end": 12.0}]
+
+    def test_small_extension_splits_into_file_then_source(self):
+        # The editor case: a 35 s render, extended by half a second.
+        pieces = recut.plan_pieces([_seg(213.251, 248.167)],
+                                   [("r.mp4", [_seg(213.251, 247.606)])])
+        assert pieces == [
+            {"path": "r.mp4", "start": 0.0, "end": 34.355},
+            {"path": None, "start": 247.606, "end": 248.167}]
+
+    def test_offsets_follow_the_base_timeline(self):
+        # The second base segment starts 10 s into the rendered file.
+        bases = [("r.mp4", [_seg(100, 110), _seg(50, 60)])]
+        assert recut.plan_pieces([_seg(52, 58)], bases) == [
+            {"path": "r.mp4", "start": 12.0, "end": 18.0}]
+
+    def test_prefers_the_span_reaching_furthest_then_the_first_base(self):
+        bases = [("r.mp4", [_seg(10, 30)]), ("c.mp4", [_seg(10, 40)])]
+        assert recut.plan_pieces([_seg(15, 35)], bases) == [
+            {"path": "c.mp4", "start": 5.0, "end": 25.0}]
+        assert recut.plan_pieces([_seg(15, 25)], bases) == [
+            {"path": "r.mp4", "start": 5.0, "end": 15.0}]
+
+    def test_float_noise_is_covered_not_a_sliver_of_source(self):
+        pieces = recut.plan_pieces([_seg(9.98, 40.03)], [("c.mp4", [_seg(10, 40)])])
+        assert pieces == [{"path": "c.mp4", "start": 0.0, "end": 30.0}]
+
+    def test_gap_between_bases_comes_from_source(self):
+        bases = [("c.mp4", [_seg(10, 20)]), ("r.mp4", [_seg(30, 40)])]
+        assert recut.plan_pieces([_seg(15, 35)], bases) == [
+            {"path": "c.mp4", "start": 5.0, "end": 10.0},
+            {"path": None, "start": 20.0, "end": 30.0},
+            {"path": "r.mp4", "start": 0.0, "end": 5.0}]
+
+    def test_no_bases_is_all_source(self):
+        assert recut.plan_pieces([_seg(5, 9)], []) == [
+            {"path": None, "start": 5.0, "end": 9.0}]
+
+
+class TestWorthHybrid:
+    def test_small_extension_is_worth_it(self):
+        pieces = [{"path": "r.mp4", "start": 0.0, "end": 34.4},
+                  {"path": None, "start": 247.6, "end": 248.2}]
+        assert recut.worth_hybrid(pieces, source_duration=600)
+
+    def test_all_file_or_all_source_is_not_hybrid(self):
+        assert not recut.worth_hybrid([{"path": "r.mp4", "start": 0, "end": 9}])
+        assert not recut.worth_hybrid([{"path": None, "start": 0, "end": 9}])
+
+    def test_mostly_new_footage_renders_whole(self):
+        pieces = [{"path": "r.mp4", "start": 0.0, "end": 5.0},
+                  {"path": None, "start": 100.0, "end": 120.0}]
+        assert not recut.worth_hybrid(pieces)
+
+    def test_window_is_clamped_to_the_source(self):
+        assert recut.hybrid_window({"start": 1.0, "end": 9.5}, 10.0) == \
+            {"start": 0.0, "end": 10.0}
+
+
+class TestSplicePieces:
+    @pytest.fixture(autouse=True)
+    def _stable_encode_args(self, monkeypatch):
+        monkeypatch.setattr(recut, "video_encode_args", lambda tier: [])
+        monkeypatch.setattr(recut, "audio_encode_args", lambda: [])
+        monkeypatch.setattr(recut, "_conform_filter",
+                            lambda path: "scale=1080:1920,setsar=1,fps=30/1")
+
+    def test_reframes_only_the_source_window_and_splices(self, tmp_path):
+        import layout_ranges
+
+        base = tmp_path / "recut_1_t_clip_1.mp4"
+        base.write_bytes(b"x")
+        layout_ranges.write(str(base), [(0.0, 34.4, "track")])
+        commands, rendered = [], []
+
+        def runner(cmd):
+            commands.append(cmd)
+            with open(cmd[-1], "wb") as f:
+                f.write(b"x")
+
+        def renderer(work, out, output_format):
+            rendered.append(work)
+            with open(out, "wb") as f:
+                f.write(b"x")
+            layout_ranges.write(out, [(0.0, 4.6, "general")])
+            return True
+
+        pieces = [{"path": str(base), "start": 0.0, "end": 34.4},
+                  {"path": None, "start": 247.6, "end": 248.2}]
+        served, clean = recut.perform_recut(
+            input_path="source.mp4", segments=[_seg(213.2, 248.2)],
+            pieces=pieces, source_duration=600.0, reframe=True,
+            output_dir=str(tmp_path), clean_name="t_clip_1.mp4",
+            runner=runner, renderer=renderer)
+
+        # One reframe, of the padded window only: never the whole cut.
+        assert len(rendered) == 1
+        window_cut = commands[0]
+        assert window_cut[window_cut.index("-ss") + 1] == "245.6"
+        assert window_cut[window_cut.index("-to") + 1] == "250.2"
+        # The splice cuts the base and the piece (2 s into its window), both
+        # conformed to the base's size and rate, then concats.
+        base_cut, piece_cut, concat = commands[1], commands[2], commands[3]
+        assert base_cut[base_cut.index("-i") + 1] == str(base)
+        assert piece_cut[piece_cut.index("-ss") + 1] == "2.0"
+        assert "-vf" in base_cut and "-vf" in piece_cut
+        assert concat[concat.index("-f") + 1] == "concat"
+        # The layouts of both files carry over onto the clip timeline.
+        assert layout_ranges.read(str(tmp_path / clean)) == [
+            {"start": 0.0, "end": 34.4, "layout": "track"},
+            {"start": 34.4, "end": 35.0, "layout": "general"}]
+        assert all(not f.startswith("temp_") for f in os.listdir(tmp_path))
+
+
+def test_reuse_input_burns_captions_on_the_file_itself(tmp_path):
+    base = tmp_path / "recut_1_t_clip_1.mp4"
+    base.write_bytes(b"x")
+    seen = []
+
+    def captioner(path, transcript, start, end):
+        seen.append((path, start, end))
+        out = tmp_path / "subtitled_2_recut_1_t_clip_1.mp4"
+        out.write_bytes(b"x")
+        return str(out)
+
+    served, clean = recut.perform_recut(
+        input_path=str(base), segments=[_seg(10, 40)], reuse_input=True,
+        output_dir=str(tmp_path), clean_name="t_clip_1.mp4",
+        captions_transcript={"segments": [{"words": [{"word": "a", "start": 0, "end": 1}]}]},
+        runner=lambda cmd: pytest.fail("nothing may be encoded"), captioner=captioner)
+    assert clean == "recut_1_t_clip_1.mp4"
+    assert served == "subtitled_2_recut_1_t_clip_1.mp4"
+    assert seen == [(str(base), 0.0, 30.0)]

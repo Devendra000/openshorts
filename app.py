@@ -3293,6 +3293,11 @@ async def process_queue():
             # The old container may still be draining its jobs on this GPU.
             await _wait_for_shared_gpu()
             _admitting.discard(job_id)
+            if (jobs.get(job_id) or {}).get('cancelled'):
+                # Cancelled while it waited for the slot (cancel_job settled it).
+                concurrency_semaphore.release()
+                job_queue.task_done()
+                continue
             if _draining:
                 concurrency_semaphore.release()
                 job_queue.task_done()
@@ -3398,6 +3403,10 @@ async def run_job_wrapper(job_id):
     try:
         if job:
             await run_job(job_id, job)
+            if job.get('cancelled'):
+                job['status'] = 'failed'
+                job['result'] = None
+                job['logs'].append(CANCELLED_LOG)
             # The queue's ETA is about this host's slots: a remote render,
             # several times slower, would skew it.
             if job.get('status') == 'completed' and job_id not in _remote_jobs:
@@ -3489,6 +3498,9 @@ _DELIVERY_STEPS = (
     ("activity", lambda jid, job: _notify_clip_activity(jid)),
 )
 _DELIVERY_VISIBLE_AFTER = "unmark"
+# A job its owner cancelled: its reservation is released and its caller told,
+# but it is no failure (no alert, no analytics outcome, no email).
+_CANCEL_DELIVERY_STEPS = ("settle", "webhook")
 
 
 def _stamp_delivery(job_id, job, done):
@@ -3538,6 +3550,11 @@ async def _deliver_job(job_id, job):
     try:
         async with _delivery_semaphore:
             for name, step in _DELIVERY_STEPS:
+                if job.get('cancelled') and name not in _CANCEL_DELIVERY_STEPS:
+                    done.add(name)
+                    if name == _DELIVERY_VISIBLE_AFTER:
+                        job.pop('delivering', None)
+                    continue
                 if name not in done:
                     try:
                         await step(job_id, job)
@@ -3649,6 +3666,8 @@ def _should_auto_retry(job) -> bool:
     # here, whatever it printed: this host decides what a video's failure is.
     if not (job and job.get('status') == 'failed' and not _draining and job.get('cmd')):
         return False
+    if job.get('cancelled'):
+        return False             # the owner stopped it: a kill is not a server fault
     # YouTube limiting the account is neither the video's fault nor a server
     # fault: the job waits out the cooldown, a few times at most, on its own
     # counter (it has not used its one retry for real failures).
@@ -3817,6 +3836,24 @@ def _archive_clip_edit_bg(job_id: str, clip_index: int, filename: str):
             print(f"⚠️  R2 edit archive error for {job_id}: {e}")
         finally:
             media_redirect.forget(job_id)
+
+    asyncio.create_task(_run())
+
+
+def _archive_metadata_bg(job_id: str):
+    """Fire-and-forget R2 refresh of a managed job's metadata JSON alone."""
+    if not BILLING_ENABLED:
+        return
+    user_id = (jobs.get(job_id) or {}).get('user_id')
+    if not user_id:
+        return
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+
+    async def _run():
+        try:
+            await cloud.videos.archive_metadata(user_id, job_id, output_dir)
+        except Exception as e:
+            print(f"⚠️  R2 metadata archive error for {job_id}: {e}")
 
     asyncio.create_task(_run())
 
@@ -5175,31 +5212,49 @@ async def _run_main(job_id, cmd, env, tick=None):
         env=env,
         cwd=os.getcwd(),
         preexec_fn=(_lower_priority if nice and launch[0] != "nice" else None),
+        # Its own process group (setsid, still a vfork): a cancel or a drain
+        # kills main.py AND what it started (WhisperX, ffmpeg), which a kill of
+        # main.py alone leaves running at full CPU.
+        start_new_session=True,
     )
+    _job_processes[job_id] = process
     # We need to capture logs in a thread because Popen isn't async
     t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
     t_log.daemon = True
     t_log.start()
 
     last_heartbeat = time.time()
-    while process.poll() is None:
-        try:
-            await asyncio.sleep(2)
-        except asyncio.CancelledError:
+    try:
+        while process.poll() is None:
             try:
-                process.kill()
-            except Exception:
-                pass
-            raise
-        if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
-            _touch_manifest(job_id)
-            last_heartbeat = time.time()
-        if tick is not None:
-            tick()
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                _kill_process_group(process)
+                raise
+            if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
+                _touch_manifest(job_id)
+                last_heartbeat = time.time()
+            if tick is not None:
+                tick()
+    finally:
+        if _job_processes.get(job_id) is process:
+            del _job_processes[job_id]
     # The exit code can be read before the reader thread saw the last lines
     # (SOURCE_READY is printed right before the exit).
     await asyncio.to_thread(t_log.join, 5)
     return process.returncode
+
+
+_job_processes: Dict[str, subprocess.Popen] = {}   # job id -> its live main.py here
+
+
+def _kill_process_group(process):
+    """SIGKILL main.py and every process it started (its own session)."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        with suppress(Exception):
+            process.kill()
 
 
 async def run_job(job_id, job_data):
@@ -5440,7 +5495,7 @@ async def _run_job_remote(job_id, job_data):
             # A worker being restarted hands its jobs back: they run again and
             # say nothing about the worker, so they do not trip the breaker
             # (a restart used to park the worker for its full 30 minutes).
-            if handed and not worker_stopped:
+            if handed and not worker_stopped and not job_data.get('cancelled'):
                 _remote_outcome(ok)
             if not ok:
                 # What the worker printed is not this host's diagnosis: the
@@ -6143,6 +6198,7 @@ async def process_endpoint(
     target_clips: Optional[str] = Form(None),
     clip_min_seconds: Optional[str] = Form(None),
     clip_max_seconds: Optional[str] = Form(None),
+    smart_boundaries: Optional[str] = Form(None),
     auto_hook: Optional[str] = Form(None),
     auto_hook_style: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
@@ -6177,6 +6233,7 @@ async def process_endpoint(
         target_clips = body.get("target_clips")
         clip_min_seconds = body.get("clip_min_seconds")
         clip_max_seconds = body.get("clip_max_seconds")
+        smart_boundaries = body.get("smart_boundaries")
         auto_hook = body.get("auto_hook")
         auto_hook_style = body.get("auto_hook_style")
         thumbnail_session_id = body.get("thumbnail_session_id")
@@ -6328,6 +6385,12 @@ async def process_endpoint(
         env["CLIP_MAX_SECONDS"] = str(max_secs)
     if n_clips is not None or min_secs is not None or max_secs is not None:
         print(f"[gen-controls] job={job_id} clips={n_clips} band={min_secs}-{max_secs}")
+    # smart_boundaries=0: the classic word snap instead of whole sentences +
+    # padding (clip_boundaries). Absent → the deployment default (on).
+    if smart_boundaries is not None and str(smart_boundaries).strip().lower() in (
+            "0", "false", "no", "off"):
+        env["CLIP_REFINE"] = "0"
+        print(f"[gen-controls] job={job_id} smart boundaries off")
 
     # captions=false: the source already carries burned-in subtitles (or the
     # caller adds its own later), so skip the free auto-caption pass instead
@@ -6776,6 +6839,57 @@ async def _status_from_snapshot(request, snap, queue):
         "queue": queue if status == 'queued' else None,
         "partial": snap.get("partial"),
     }
+
+
+CANCELLED_LOG = "Cancelled by you."
+
+
+def _drop_queued_entry(job_id) -> bool:
+    """Take a job's entry out of the waiting heap. True when it was there."""
+    heap = job_queue._queue
+    for entry in list(heap):
+        if entry[2] == job_id:
+            heap.remove(entry)
+            heapq.heapify(heap)
+            job_queue.task_done()
+            _queue_changed()
+            return True
+    return False
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, request: Request):
+    """Stop a job its owner no longer wants, queued or running: the process
+    tree is killed (or the remote worker's claim dropped), the reserved
+    minutes are released and the job ends as failed with CANCELLED_LOG. A job
+    already finished (or delivering) is left as it is."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, job)
+    if job.get('cancelled'):
+        return {"status": "cancelled"}
+    if job.get('status') not in ('queued', 'processing') or job.get('delivering'):
+        return {"status": job.get('status'), "cancelled": False}
+    job['cancelled'] = True
+    print(f"🛑 Job {job_id} cancelled by its owner.")
+    if job_id in _running_jobs:
+        # run_job_wrapper sees the process end and settles it.
+        if job_id in _remote_jobs:
+            remote_worker.clear(job['output_dir'], purge=True)
+        else:
+            process = _job_processes.get(job_id)
+            if process is not None:
+                _kill_process_group(process)
+        return {"status": "cancelled"}
+    # Waiting: in the heap, waiting for a slot (the dispatcher skips it), or
+    # in an auto-retry's delay (its timer sees it is no longer queued).
+    _drop_queued_entry(job_id)
+    job['status'] = 'failed'
+    job['logs'].append(CANCELLED_LOG)
+    _begin_delivery(job_id, job)
+    asyncio.create_task(_deliver_job(job_id, job))
+    return {"status": "cancelled"}
 
 
 @app.get("/api/status/{job_id}")
@@ -7697,6 +7811,71 @@ _rerender_locks: Dict[str, asyncio.Lock] = {}
 _scenes_locks: Dict[str, asyncio.Lock] = {}
 
 
+class TranscriptWordFix(BaseModel):
+    """Correct what one transcript word says (a mishearing, "zombie" for "off
+    me"), keeping its timestamps. The word is named by its source-absolute
+    start/end, exactly as GET .../edl lists it."""
+    start: float
+    end: float
+    text: str
+
+
+# Two decimals of float noise between the edl's words and the stored ones.
+_WORD_MATCH_SECONDS = 0.002
+MAX_WORD_FIX_CHARS = 60
+
+
+@app.post("/api/job/{job_id}/transcript/word")
+async def fix_transcript_word(job_id: str, req: TranscriptWordFix, request: Request):
+    """Fix the text of one word of the job's source transcript.
+
+    Fixed at the source, every caption made from it afterwards (re-apply
+    captions on a recut, subtitle restyles, every clip of the job) says the
+    right thing on the right beat, instead of a per-clip caption edit that the
+    next recut throws away. Timestamps never change: the audio did not.
+    """
+    text = " ".join((req.text or "").split())
+    if not text or len(text) > MAX_WORD_FIX_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The word must be 1 to {MAX_WORD_FIX_CHARS} characters.")
+    await _ensure_job_files(job_id, request)
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, jobs[job_id])
+
+    # Same lock as rerenders: both read-modify-write metadata.json.
+    lock = _rerender_locks.setdefault(job_id, asyncio.Lock())
+    async with lock:
+        output_dir = os.path.join(OUTPUT_DIR, job_id)
+        json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+        if not json_files:
+            raise HTTPException(status_code=404, detail="Metadata not found")
+        with open(json_files[0], 'r') as f:
+            data = json.load(f)
+        segments = (data.get('transcript') or {}).get('segments') or []
+        for seg in segments:
+            words = seg.get('words') or []
+            for w in words:
+                try:
+                    hit = (abs(float(w['start']) - req.start) <= _WORD_MATCH_SECONDS
+                           and abs(float(w['end']) - req.end) <= _WORD_MATCH_SECONDS)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not hit:
+                    continue
+                # Leading space: Whisper's word-boundary convention, which the
+                # caption block collector relies on.
+                w['word'] = " " + text
+                seg['text'] = " ".join(str(x.get('word', '')).strip() for x in words
+                                       if str(x.get('word', '')).strip())
+                write_json_atomic(json_files[0], data, indent=2)
+                _archive_metadata_bg(job_id)
+                return {"success": True,
+                        "word": {"w": text, "s": float(w['start']), "e": float(w['end'])}}
+    raise HTTPException(status_code=404, detail="Word not found in the transcript")
+
+
 @app.post("/api/clip/rerender")
 async def rerender_clip(req: RerenderRequest, request: Request):
     """Re-render a clip from an edited EDL (the clip editor's save button).
@@ -7723,6 +7902,39 @@ async def rerender_clip(req: RerenderRequest, request: Request):
     lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
     async with lock:
         return await _rerender_locked(req, request, job)
+
+
+def _rendered_bases(clip, output_dir, canonical_path, framing):
+    """[(path, segments)] of files already holding this clip's reframed
+    footage in ``framing``, for recut.plan_pieces: the last editor render
+    first, then the pipeline's canonical clip (always rendered 'auto')."""
+    bases = []
+    recipe = clip.get('recipe') or {}
+    rendered = recipe.get('rendered')
+    # Read back from metadata on disk: only ever a bare recut_ file name.
+    if (isinstance(rendered, str) and rendered.startswith('recut_')
+            and rendered == os.path.basename(rendered)
+            and (recipe.get('framing') or 'auto') == framing
+            and not clip.get('crop_overrides')):
+        path = os.path.join(output_dir, rendered)
+        try:
+            segments = recut.normalize_segments(recipe.get('segments'))
+        except recut.RecutError:
+            segments = None
+        if segments and os.path.exists(path):
+            bases.append((path, segments))
+    if framing == 'auto' and os.path.exists(canonical_path):
+        _, canonical_range = _clip_recipe_parts(clip)
+        bases.append((canonical_path, [canonical_range]))
+    return bases
+
+
+def _base_length(clip, output_dir, canonical_path, framing, path):
+    """Seconds of footage ``path`` holds, by the recipe of the base it is."""
+    for base_path, segments in _rendered_bases(clip, output_dir, canonical_path, framing):
+        if base_path == path:
+            return recut.total_duration(segments)
+    return -1.0
 
 
 async def _rerender_locked(req: RerenderRequest, request: Request, job):
@@ -7782,14 +7994,23 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     except recut.RecutError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # A framing override always re-reframes from the source: the canonical file
-    # has the old layout baked into its pixels.
-    fast = (force_strategy is None
-            and os.path.exists(canonical_path)
-            and recut.within_range(segments, canonical_range['start'],
-                                   canonical_range['end']))
+    # Files that already hold reframed footage of this clip, best first: the
+    # last render (recipe.rendered, its timeline = recipe.segments) and the
+    # pipeline's canonical clip. Each only for the framing baked into its
+    # pixels. A new cut takes what they hold and reframes only the rest.
+    pieces = recut.plan_pieces(
+        segments, _rendered_bases(clip, output_dir, canonical_path, framing))
+    fast = bool(pieces) and all(p['path'] for p in pieces)
+    # The cut is exactly a file we already have (a caption-only change, e.g. a
+    # fixed transcript word): reuse it and only burn the captions again.
+    reuse = (fast and len(pieces) == 1 and pieces[0]['start'] <= recut.RANGE_TOLERANCE
+             and abs(pieces[0]['end'] - _base_length(clip, output_dir, canonical_path,
+                                                     framing, pieces[0]['path']))
+             <= recut.RANGE_TOLERANCE)
     if not fast and not source_path and archived is not None:
         source_path = await _locate_or_fetch_source(req.job_id)
+    hybrid = (not fast and bool(source_path)
+              and recut.worth_hybrid(pieces, source_duration))
     if not fast and not source_path:
         raise HTTPException(
             status_code=409,
@@ -7807,14 +8028,30 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
                     if req.reapply_captions else None)
 
     def run_recut():
-        if fast:
+        if reuse:
             return recut.perform_recut(
-                input_path=canonical_path,
-                segments=recut.rebase_segments(
-                    segments, canonical_range['start'], canonical_range['end']),
+                input_path=pieces[0]['path'], segments=segments, reuse_input=True,
+                output_dir=output_dir, clean_name=clean_name,
+                captions_transcript=v_transcript,
+                captioner=_recut_captioner(clip))
+        if fast and len({p['path'] for p in pieces}) == 1:
+            return recut.perform_recut(
+                input_path=pieces[0]['path'],
+                segments=[{"start": p['start'], "end": p['end']} for p in pieces],
                 output_dir=output_dir, clean_name=clean_name,
                 reframe=False, captions_transcript=v_transcript,
                 captioner=_recut_captioner(clip))
+        if fast or hybrid:
+            return recut.perform_recut(
+                input_path=source_path, segments=segments, pieces=pieces,
+                source_duration=source_duration,
+                output_dir=output_dir, clean_name=clean_name,
+                reframe=hybrid, output_format=data.get('output_format', 'auto'),
+                force_strategy=force_strategy,
+                captions_transcript=v_transcript,
+                captioner=_recut_captioner(clip),
+                subtitle_band=(data.get('source_subtitle_band')
+                               if v_transcript else None))
         return recut.perform_recut(
             input_path=source_path, segments=segments,
             output_dir=output_dir, clean_name=clean_name,
@@ -7833,7 +8070,9 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
 
         new_video_url = f"/videos/{req.job_id}/{served_name}"
         new_recipe = {"v": 1, "segments": segments,
-                      "canonical_range": canonical_range}
+                      "canonical_range": canonical_range,
+                      "rendered": (_clean_recut_name
+                                   if _clean_recut_name.startswith('recut_') else None)}
         if framing != 'auto':
             new_recipe["framing"] = framing
         # Covering range, deliberately not segments[0]/segments[-1]: segments
@@ -7844,8 +8083,9 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
 
         updates = {'video_url': new_video_url, 'start': new_start,
                    'end': new_end, 'recipe': new_recipe,
-                   # The stacked stretches of THIS render (empty on the fast
-                   # path, which never reframes): captions follow them.
+                   # The stacked stretches of THIS render (carried over from
+                   # the files it was cut from on the fast/hybrid paths):
+                   # captions follow them.
                    'layout_ranges': layout_ranges.read(
                        os.path.join(output_dir, _clean_recut_name))}
         # Per-scene manual framing is keyed by scene indices of a specific cut;
@@ -7877,7 +8117,8 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             "start": new_start,
             "end": new_end,
             "duration": total,
-            "render_path": "fast" if fast else "source",
+            "render_path": ("captions" if reuse else "fast" if fast
+                            else "hybrid" if hybrid else "source"),
             "mode": "normal",
         }
     except Exception as e:
@@ -9238,6 +9479,298 @@ async def translate_clip(
         "success": True,
         "new_video_url": f"/videos/{req.job_id}/{output_filename}"
     }
+
+class VoiceoverRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    script: str
+    voice_id: str
+    # duck: clip audio quietly under the voice; mix: both full; replace.
+    original_audio: str = "duck"
+    # eleven_v3 performs [excited]-style tags; eleven_multilingual_v2 drops them.
+    model: str = "eleven_v3"
+    input_filename: Optional[str] = None
+
+
+async def _voiceover_target(request, job_id, clip_index, input_filename):
+    """Owner-checked clip file a voiceover/audio mix starts from.
+
+    Returns (job, data, clips, metadata_path, output_dir, filename). The free
+    plan's wm_ copy is walked back to its clean twin, and a previous
+    ``translated_vo_`` to the file under it, so a new track replaces the old
+    one instead of stacking on it."""
+    import translate as _tr
+
+    await _ensure_job_files(job_id, request)
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    await _assert_job_owner(request, job)
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    clips = data.get('shorts', [])
+    if not 0 <= clip_index < len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    if input_filename:
+        filename = os.path.basename(input_filename)
+    else:
+        filename = (clips[clip_index].get('video_url') or '').split('/')[-1]
+    if not filename:
+        raise HTTPException(status_code=404, detail="Clip file not found")
+    filename = _strip_watermark_copy(output_dir, filename)
+    while filename.startswith(_tr.VOICEOVER_PREFIX):
+        under = filename[len(_tr.VOICEOVER_PREFIX):]
+        if not os.path.exists(os.path.join(output_dir, under)):
+            break
+        filename = under
+    if not os.path.isfile(os.path.join(output_dir, filename)):
+        raise HTTPException(status_code=404, detail="Clip file not found")
+    return job, data, clips, json_files[0], output_dir, filename
+
+
+async def _voiceover_finish(request, job_id, clip_index, job, data, clips,
+                            metadata_path, output_filename, detail):
+    """AI mark, delivery copy, metadata and archive for a new audio track."""
+    loop = asyncio.get_event_loop()
+    output_path = os.path.join(OUTPUT_DIR, job_id, output_filename)
+    if detail:
+        # AI Act art. 50(2): synthetic voice, machine-readable mark (best-effort).
+        from ffmpeg_utils import mark_ai_generated
+        await loop.run_in_executor(
+            None, lambda: mark_ai_generated(output_path, detail))
+    output_filename = await _deliver(request, job_id, output_filename)
+    new_url = f"/videos/{job_id}/{output_filename}"
+    if clip_index < len(job.get('result', {}).get('clips', [])):
+        job['result']['clips'][clip_index]['video_url'] = new_url
+    try:
+        clips[clip_index]['video_url'] = new_url
+        data['shorts'] = clips
+        write_json_atomic(metadata_path, data, indent=4)
+    except Exception as e:
+        print(f"⚠️ Failed to update metadata.json: {e}")
+    _archive_clip_edit_bg(job_id, clip_index, output_filename)
+    return {"success": True, "new_video_url": new_url}
+
+
+@app.post("/api/voiceover")
+async def voiceover_clip(
+    req: VoiceoverRequest,
+    request: Request,
+    x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key")
+):
+    """Text-to-speech: the user's script, spoken by an ElevenLabs voice over a clip.
+
+    The output is a ``translated_vo_`` file: like a dub, its audio is new, so
+    it shares the dub's watermark handling and its subtitles are transcribed
+    from the new audio rather than taken from the source transcript."""
+    import translate as _tr
+
+    if not x_elevenlabs_key:
+        raise HTTPException(status_code=400, detail="Missing X-ElevenLabs-Key header")
+    script = (req.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="The script is empty")
+    if len(script) > _tr.MAX_SCRIPT_CHARS:
+        raise HTTPException(status_code=400,
+                            detail=f"The script is longer than {_tr.MAX_SCRIPT_CHARS} characters")
+    if not _tr.valid_voice_id(req.voice_id):
+        raise HTTPException(status_code=400, detail="Invalid voice id")
+    if req.original_audio not in _tr.ORIGINAL_AUDIO_MODES:
+        raise HTTPException(status_code=400, detail="Invalid original_audio")
+    if req.model not in _tr.TTS_MODELS:
+        raise HTTPException(status_code=400, detail="Invalid model")
+
+    job, data, clips, meta, output_dir, filename = await _voiceover_target(
+        request, req.job_id, req.clip_index, req.input_filename)
+    output_filename = f"{_tr.VOICEOVER_PREFIX}{filename}"
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, lambda: _tr.voiceover_video(
+            video_path=os.path.join(output_dir, filename),
+            output_path=os.path.join(output_dir, output_filename),
+            script=script, voice_id=req.voice_id, api_key=x_elevenlabs_key,
+            original_audio=req.original_audio, model_id=req.model))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except _tr.TTSError as e:
+        print(f"❌ Voiceover TTS Error: {e}")
+        raise HTTPException(status_code=400 if e.status in (401, 402, 422) else 502,
+                            detail=str(e))
+    except Exception as e:
+        print(f"❌ Voiceover Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    return await _voiceover_finish(request, req.job_id, req.clip_index, job, data,
+                                   clips, meta, output_filename, "AI voiceover")
+
+
+@app.post("/api/voiceover/upload")
+async def voiceover_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    job_id: str = Form(...),
+    clip_index: int = Form(...),
+    original_audio: str = Form("duck"),
+    input_filename: Optional[str] = Form(None),
+    placements: Optional[str] = Form(None),
+):
+    """Mix an audio file the user uploads (their own voiceover, a music bed)
+    into a clip. Cut at the clip's end; nothing synthetic, so no AI mark.
+
+    ``placements`` (optional, one per line, ``0:00-0:05 -> 0:05-0:10``) puts
+    parts of the track at chosen clip times instead of the whole track from
+    0:00 (translate.parse_audio_placements)."""
+    import tempfile
+    import translate as _tr
+
+    if original_audio not in _tr.ORIGINAL_AUDIO_MODES:
+        raise HTTPException(status_code=400, detail="Invalid original_audio")
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _tr.UPLOAD_AUDIO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported audio file type")
+    try:
+        pieces = _tr.parse_audio_placements((placements or "")[:20000])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    job, data, clips, meta, output_dir, filename = await _voiceover_target(
+        request, job_id, clip_index, input_filename)
+
+    fd, audio_path = tempfile.mkstemp(suffix=ext, prefix="vo_upload_")
+    try:
+        size = 0
+        with os.fdopen(fd, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > _tr.MAX_UPLOAD_AUDIO_BYTES:
+                    raise HTTPException(status_code=413, detail="Audio file is larger than 50 MB")
+                out.write(chunk)
+        if size == 0:
+            raise HTTPException(status_code=400, detail="The audio file is empty")
+        output_filename = f"{_tr.VOICEOVER_PREFIX}{filename}"
+        try:
+            video_path = os.path.join(output_dir, filename)
+            out_path = os.path.join(output_dir, output_filename)
+            if pieces:
+                work = lambda: _tr.mix_audio_pieces(  # noqa: E731
+                    video_path, audio_path, out_path, pieces, original_audio=original_audio)
+            else:
+                work = lambda: _tr.mix_audio_into_video(  # noqa: E731
+                    video_path, audio_path, out_path,
+                    original_audio=original_audio, fit_voice=False)
+            await asyncio.get_event_loop().run_in_executor(None, work)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            print(f"❌ Audio mix Error: {e}")
+            raise HTTPException(status_code=500, detail="Could not mix that audio file")
+    finally:
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
+    return await _voiceover_finish(request, job_id, clip_index, job, data,
+                                   clips, meta, output_filename, None)
+
+
+async def _save_upload_capped(upload: UploadFile, path: str, max_bytes: int, what: str) -> int:
+    size = 0
+    with open(path, "wb") as out:
+        while chunk := await upload.read(1024 * 1024):
+            size += len(chunk)
+            if size > max_bytes:
+                raise HTTPException(status_code=413,
+                                    detail=f"The {what} is larger than {max_bytes // (1024 * 1024)} MB")
+            out.write(chunk)
+    if size == 0:
+        raise HTTPException(status_code=400, detail=f"The {what} is empty")
+    return size
+
+
+@app.post("/api/audio-mix")
+async def audio_mix(
+    request: Request,
+    video: UploadFile = File(...),
+    audio: UploadFile = File(...),
+    original_audio: str = Form("duck"),
+    placements: Optional[str] = Form(None),
+):
+    """Standalone mixer: the user's own video + audio file in, the mixed video
+    back as a download. No job, nothing generated or kept: both uploads and
+    the result live in a temp dir removed once the response is sent.
+
+    ``placements`` as in /api/voiceover/upload (``0:00-0:05 -> 0:05-0:10`` per
+    line); empty plays the whole track from the start."""
+    import shutil
+    import tempfile
+    from starlette.background import BackgroundTask
+    import translate as _tr
+
+    if BILLING_ENABLED and await _user_from_request(request) is None:
+        raise HTTPException(status_code=401, detail="Sign in to use the audio mixer")
+    if original_audio not in _tr.ORIGINAL_AUDIO_MODES:
+        raise HTTPException(status_code=400, detail="Invalid original_audio")
+    v_ext = os.path.splitext(video.filename or "")[1].lower()
+    a_ext = os.path.splitext(audio.filename or "")[1].lower()
+    if v_ext not in _tr.UPLOAD_VIDEO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported video file type")
+    if a_ext not in _tr.UPLOAD_AUDIO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported audio file type")
+    try:
+        pieces = _tr.parse_audio_placements((placements or "")[:20000])
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    work_dir = tempfile.mkdtemp(prefix="audio_mix_")
+    cleanup = lambda: shutil.rmtree(work_dir, ignore_errors=True)  # noqa: E731
+    try:
+        video_path = os.path.join(work_dir, f"video{v_ext}")
+        audio_path = os.path.join(work_dir, f"audio{a_ext}")
+        out_path = os.path.join(work_dir, "mixed.mp4")
+        await _save_upload_capped(video, video_path, _tr.MAX_UPLOAD_VIDEO_BYTES, "video")
+        await _save_upload_capped(audio, audio_path, _tr.MAX_UPLOAD_AUDIO_BYTES, "audio file")
+        if pieces:
+            work = lambda: _tr.mix_audio_pieces(  # noqa: E731
+                video_path, audio_path, out_path, pieces, original_audio=original_audio)
+        else:
+            work = lambda: _tr.mix_audio_into_video(  # noqa: E731
+                video_path, audio_path, out_path,
+                original_audio=original_audio, fit_voice=False)
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, work)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            print(f"❌ Audio mix Error: {e}")
+            raise HTTPException(status_code=500, detail="Could not mix those files")
+    except BaseException:
+        cleanup()
+        raise
+
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", os.path.splitext(video.filename or "")[0]).strip("_")[:60]
+    return FileResponse(out_path, media_type="video/mp4",
+                        filename=f"{stem or 'video'}_mixed.mp4",
+                        background=BackgroundTask(cleanup))
+
+
+@app.get("/api/voiceover/voices")
+async def voiceover_voices(
+    x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key")
+):
+    """The voices of the caller's ElevenLabs account (empty without a key)."""
+    if not x_elevenlabs_key:
+        return {"voices": []}
+    from saasshorts import get_elevenlabs_voices
+    try:
+        voices = await asyncio.get_event_loop().run_in_executor(
+            None, get_elevenlabs_voices, x_elevenlabs_key)
+    except Exception as e:
+        print(f"⚠️ ElevenLabs voices: {e}")
+        voices = []
+    return {"voices": voices or []}
 
 class SocialPostRequest(BaseModel):
     job_id: str

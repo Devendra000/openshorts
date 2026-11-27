@@ -54,10 +54,58 @@ function clipDurationSeconds(clip) {
     return clip.end && clip.start ? clip.end - clip.start : NaN;
 }
 
+function fmtClock(t) {
+    if (!Number.isFinite(t)) return '–:––';
+    const m = Math.floor(t / 60);
+    return `${m}:${(t - m * 60).toFixed(1).padStart(4, '0')}`;
+}
+
+const BOUNDARY_WARNINGS = {
+    incomplete_sentence_start: 'starts mid-sentence',
+    incomplete_sentence_end: 'ends mid-sentence',
+    missing_context: 'may lack context',
+    speech_cutoff_start: 'sound cut at start',
+    speech_cutoff_end: 'sound cut at end',
+    excessive_silence: 'long silence',
+    too_short: 'short',
+    llm_incoherent: 'may not stand alone',
+};
+
+// Smart boundaries (clip_boundaries.py): where the AI put the edges, where
+// they ended up, why, and what still looks off. Null for old jobs.
+function boundaryInfo(clip) {
+    const b = clip?.boundaries;
+    if (!b || !Array.isArray(b.ai)) return null;
+    const [aiStart, aiEnd] = b.ai;
+    const moved = Math.abs(aiStart - b.start) > 0.05 || Math.abs(aiEnd - b.end) > 0.05;
+    return {
+        refined: !!b.refined,
+        moved,
+        label: `ai ${fmtClock(aiStart)}–${fmtClock(aiEnd)}` + (moved ? ` → ${fmtClock(b.start)}–${fmtClock(b.end)}` : ''),
+        reasons: (b.reasons || []).join('\n'),
+        warnings: (b.warnings || []).map((w) => BOUNDARY_WARNINGS[w]).filter(Boolean),
+    };
+}
+
 function formatDuration(clip) {
     const secs = Math.floor(clipDurationSeconds(clip));
     if (!Number.isFinite(secs) || secs < 0) return null;
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
+}
+
+export function getClipDownloadFilename(clip, index, customTitle = null) {
+    const rawTitle = (typeof customTitle === 'string' && customTitle.trim())
+        || clip?.video_title_for_youtube_short
+        || clip?.title
+        || '';
+    const cleanTitle = rawTitle
+        .replace(/[\\/:*?"<>|]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 100)
+        .replace(/[. ]+$/, '');
+    const num = (index ?? 0) + 1;
+    return cleanTitle ? `${num} ${cleanTitle}.mp4` : `clip-${num}.mp4`;
 }
 
 export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onModeChanged = null, onUpgrade = null }) {
@@ -176,7 +224,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
             const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
-            a.download = `clip-${index + 1}.mp4`;
+            a.download = getClipDownloadFilename(clip, index, postTitle);
             document.body.appendChild(a);
             a.click();
             window.URL.revokeObjectURL(url);
@@ -686,6 +734,62 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         }
     };
 
+    // Voiceover (ElevenLabs TTS from a script) and uploaded audio both answer
+    // like /api/translate: a new clip file that replaces the current one.
+    const runAudioEdit = async (send) => {
+        setIsTranslating(true);
+        setEditError(null);
+        try {
+            const res = await send();
+            if (!res.ok) {
+                const errText = await res.text();
+                let detail = errText;
+                try { detail = JSON.parse(errText).detail || errText; } catch { /* not json */ }
+                throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+            }
+            const data = await res.json();
+            if (data.new_video_url) {
+                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                setServerVideoFile(data.new_video_url.split('/').pop());
+                if (videoRef.current) videoRef.current.load();
+                setShowTranslateModal(false);
+            }
+        } catch (e) {
+            setEditError(e.message);
+            setTimeout(() => setEditError(null), 5000);
+        } finally {
+            setIsTranslating(false);
+        }
+    };
+
+    const handleVoiceover = ({ script, voiceId, originalAudio, model }) => runAudioEdit(() => {
+        if (!elevenLabsKey) throw new Error('ElevenLabs API Key is missing. Please set it in Settings.');
+        return apiFetch('/api/voiceover', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-ElevenLabs-Key': elevenLabsKey },
+            body: JSON.stringify({
+                job_id: jobId,
+                clip_index: index,
+                script,
+                voice_id: voiceId,
+                original_audio: originalAudio,
+                model,
+                input_filename: serverVideoFile,
+            }),
+        });
+    });
+
+    const handleAudioUpload = ({ file, originalAudio, placements }) => runAudioEdit(() => {
+        const form = new FormData();
+        form.append('file', file);
+        form.append('job_id', jobId);
+        form.append('clip_index', String(index));
+        form.append('original_audio', originalAudio);
+        if (serverVideoFile) form.append('input_filename', serverVideoFile);
+        if (placements) form.append('placements', placements);
+        return apiFetch('/api/voiceover/upload', { method: 'POST', body: form });
+    });
+
     const handleTranslate = async (options) => {
         console.log('[Translate] Starting translation with options:', options);
         setIsTranslating(true);
@@ -856,6 +960,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
         : currentVideoUrl;
 
     const durationReadout = formatDuration(clip);
+    const boundaries = boundaryInfo(clip);
 
     return (
         <div className="card overflow-hidden flex flex-col md:flex-row group hover:border-rule2 transition-colors animate-fade md:min-h-[420px]" style={{ animationDelay: `${index * 0.1}s` }}>
@@ -907,8 +1012,8 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 />
                 <div className="absolute top-3 left-3 flex gap-2">
                     {/* Stays the clip's own number, not its rank: the cards are
-                        ordered by score, but this is what the downloaded file
-                        is called (clip-N.mp4) and what every api call indexes. */}
+                        ordered by score, but this is what prefixes the downloaded file
+                        (N <Title>.mp4) and what every api call indexes. */}
                     <span className="bg-black/70 text-ink font-mono text-micro uppercase px-2 py-1 rounded-full">
                         Clip {index + 1}
                     </span>
@@ -981,6 +1086,16 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         {resolution && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">{resolution}</span>}
                         {isPro && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0 text-brass">pro mode</span>}
                         {!isPro && clip.pro_suggested && <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0 text-brass">pro recommended</span>}
+                        {boundaries?.refined && (
+                            <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0" title={boundaries.reasons}>
+                                {boundaries.label}
+                            </span>
+                        )}
+                        {boundaries?.warnings.map((w) => (
+                            <span key={w} className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0 text-brass" title={boundaries.reasons}>
+                                {w}
+                            </span>
+                        ))}
                         <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">#shorts</span>
                         <span className="readout bg-paper3 px-2 py-0.5 rounded-full shrink-0">#viral</span>
                     </div>
@@ -1130,7 +1245,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         className={QUIET_BTN}
                     >
                         {isTranslating ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <Languages size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
-                        {isTranslating ? 'translating…' : 'dub voice'}
+                        {isTranslating ? 'working…' : 'voice / audio'}
                     </button>
 
                     <button
@@ -1352,9 +1467,13 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 isOpen={showTranslateModal}
                 onClose={() => setShowTranslateModal(false)}
                 onTranslate={handleTranslate}
+                onVoiceover={handleVoiceover}
+                onAudioUpload={handleAudioUpload}
                 isProcessing={isTranslating}
                 videoUrl={currentVideoUrl}
                 hasApiKey={!!elevenLabsKey}
+                elevenLabsKey={elevenLabsKey}
+                clipSeconds={clip.end && clip.start ? clip.end - clip.start : 0}
             />
 
             {showWatermarkModal && (

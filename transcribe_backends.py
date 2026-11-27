@@ -18,7 +18,9 @@ Invariants the consumers rely on (clip cutting, karaoke subtitles, Remotion):
   - all numerics are native Python floats (json.dump of the transcript).
   - words sorted by start, segments chronological, absolute file timestamps.
 
-TRANSCRIBE_BACKEND env: "whisper" (default) | "parakeet".
+TRANSCRIBE_BACKEND env: "whisper" (default) | "parakeet" | "whisperx".
+"whisperx" runs a local WhisperX install as a subprocess (whisperx_backend)
+and falls back to WHISPERX_FALLBACK (default whisper) when it fails.
 The parakeet path falls back to whisper automatically when the model errors,
 produces no usable words, or the detected language is outside its 25
 supported European languages (e.g. Japanese/Chinese/Arabic uploads).
@@ -858,6 +860,21 @@ def transcribe_media(media_path):
 
     backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
 
+    if backend == "whisperx":
+        # Local WhisperX in its own virtualenv (whisperx_backend). On failure
+        # the existing provider transcribes instead (WHISPERX_FALLBACK).
+        import whisperx_backend
+        try:
+            return whisperx_backend.transcribe(media_path)
+        except GpuUnavailable:
+            raise
+        except Exception as e:
+            backend = whisperx_backend.fallback_backend()
+            if backend == "none":
+                raise
+            print(f"⚠️ [ASR] whisperx failed ({type(e).__name__}: {e}) — "
+                  f"falling back to {backend}", flush=True)
+
     if backend == "parakeet":
         try:
             transcript = _transcribe_with_parakeet(media_path)
@@ -877,4 +894,7 @@ def transcribe_media(media_path):
         except Exception as e:
             print(f"⚠️ [ASR] could not release parakeet ({type(e).__name__}: {e})")
 
-    return _transcribe_with_whisper(media_path)
+    transcript = _transcribe_with_whisper(media_path)
+    print(f"🎙️ [ASR] provider=whisper ok: lang={transcript.get('language')} "
+          f"segments={len(transcript.get('segments') or [])}", flush=True)
+    return transcript

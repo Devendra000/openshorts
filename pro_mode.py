@@ -535,19 +535,25 @@ def _ask_model(prompt, api_key):
         titles: List[Title]
 
     import llm_backend
-    if llm_backend.active():
+    if not api_key or llm_backend.active():
         return llm_backend.generate_json(prompt, Titles)[0]
     from google import genai
     from google.genai import types as genai_types
     # Keep the client in a name: one built inline is closed before its call
     # is sent ("client has been closed").
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite",
-        contents=[prompt],
-        config=genai_types.GenerateContentConfig(
-            response_mime_type="application/json", response_schema=Titles))
-    return json.loads(response.text) or {}
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite",
+            contents=[prompt],
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json", response_schema=Titles))
+        return json.loads(response.text) or {}
+    except Exception as e:
+        if llm_backend.configured():
+            print(f"   ⚠️ Pro titles Gemini failed ({type(e).__name__}: {e}), falling back to local LLM...")
+            return llm_backend.generate_json(prompt, Titles)[0]
+        raise
 
 
 def _plain(text):

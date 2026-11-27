@@ -275,13 +275,16 @@ class TestRerenderPaths:
         assert call["force_strategy"] == "WIDE"
 
         # A follow-up trim WITHOUT a framing field inherits the recipe's
-        # framing (the look must not silently revert on a plain trim)...
+        # framing (the look must not silently revert on a plain trim), and is
+        # cut from the WIDE render it trims instead of reframing again...
         resp2 = _request("POST", "/api/clip/rerender", {
             "job_id": JOB_ID, "clip_index": 0,
             "segments": [{"start": 13, "end": 21}]})
         assert resp2.status_code == 200
         assert resp2.json()["framing"] == "full"
-        assert fake_recut[1]["force_strategy"] == "WIDE"
+        assert resp2.json()["render_path"] == "fast"
+        assert fake_recut[1]["input_path"].endswith("recut_1_mytitle_clip_1.mp4")
+        assert fake_recut[1]["segments"] == [{"start": 1.0, "end": 9.0}]
 
         # ...while an explicit 'auto' resets to the classifier and the fast path.
         resp3 = _request("POST", "/api/clip/rerender", {
@@ -290,6 +293,55 @@ class TestRerenderPaths:
         assert resp3.status_code == 200
         assert resp3.json()["render_path"] == "fast"
         assert "framing" not in resp3.json()["recipe"]
+
+
+class TestRerenderReuse:
+    """A cut is taken from the files that already hold it; only footage none
+    of them holds is reframed, and only that."""
+
+    def _post(self, segments):
+        resp = _request("POST", "/api/clip/rerender", {
+            "job_id": JOB_ID, "clip_index": 0, "segments": segments})
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_small_extension_reframes_only_the_new_stretch(self, job, fake_recut):
+        data = self._post([{"start": 10, "end": 41}])
+        assert data["render_path"] == "hybrid"
+        call = fake_recut[0]
+        assert call["input_path"].endswith("src.mp4")
+        assert call["pieces"] == [
+            {"path": str(job["dir"] / "mytitle_clip_1.mp4"), "start": 0.0, "end": 30.0},
+            {"path": None, "start": 40.0, "end": 41.0}]
+        assert data["recipe"]["rendered"] == "recut_1_mytitle_clip_1.mp4"
+
+    def test_trim_after_an_extension_cuts_from_the_last_render(self, job, fake_recut):
+        self._post([{"start": 30, "end": 50}])  # mostly new: whole render
+        assert fake_recut[0]["reframe"] is True and not fake_recut[0].get("pieces")
+        data = self._post([{"start": 42, "end": 48}])
+        assert data["render_path"] == "fast"
+        assert fake_recut[1]["input_path"].endswith("recut_1_mytitle_clip_1.mp4")
+        assert fake_recut[1]["segments"] == [{"start": 12.0, "end": 18.0}]
+
+    def test_unchanged_cut_only_reburns_captions(self, job, fake_recut):
+        # A fixed transcript word: same cut, same framing. Nothing is cut or
+        # encoded; the file already rendered gets its captions again.
+        data = self._post([{"start": 10, "end": 40}])
+        assert data["render_path"] == "captions"
+        call = fake_recut[0]
+        assert call["reuse_input"] is True
+        assert call["input_path"].endswith("mytitle_clip_1.mp4")
+        assert call["captions_transcript"]["segments"][0]["words"]
+
+    def test_a_stored_rendered_name_is_never_a_path(self, job, fake_recut):
+        meta = json.loads(job["meta_path"].read_text())
+        meta["shorts"][0]["recipe"] = {
+            "v": 1, "segments": [{"start": 10, "end": 40}],
+            "canonical_range": {"start": 10, "end": 40},
+            "rendered": "../../src.mp4"}
+        job["meta_path"].write_text(json.dumps(meta))
+        self._post([{"start": 12, "end": 20}])
+        assert fake_recut[0]["input_path"].endswith("mytitle_clip_1.mp4")
 
 
 class TestRerenderPersistence:
@@ -345,3 +397,29 @@ class TestMcpTool:
         names = [t["name"] for t in mcp_server.TOOLS]
         assert "recut_clip" in names
         assert "recut_clip" in mcp_server._TOOL_IMPLS
+
+
+class TestFixTranscriptWord:
+    """A misheard word is corrected at the source: same timestamps, new text,
+    and every caption made afterwards says it."""
+
+    def _fix(self, body):
+        return _request("POST", f"/api/job/{JOB_ID}/transcript/word", body)
+
+    def test_fixes_the_text_and_keeps_the_timing(self, job):
+        resp = self._fix({"start": 20.0, "end": 20.4, "text": "  off   me "})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["word"] == {"w": "off me", "s": 20.0, "e": 20.4}
+        seg = json.loads(job["meta_path"].read_text())["transcript"]["segments"][0]
+        assert seg["words"][1] == {"word": " off me", "start": 20.0, "end": 20.4}
+        assert seg["text"] == "hello off me again"
+        # The editor's word list (and so every recut's captions) follows.
+        data = _request("GET", f"/api/clip/{JOB_ID}/0/edl").json()
+        assert [w["w"] for w in data["words"]] == ["hello", "off me", "again"]
+
+    def test_unknown_word_404_and_bad_text_400(self, job):
+        assert self._fix({"start": 21.0, "end": 21.4, "text": "x"}).status_code == 404
+        assert self._fix({"start": 20.0, "end": 20.4, "text": "   "}).status_code == 400
+        assert self._fix({"start": 20.0, "end": 20.4, "text": "a" * 61}).status_code == 400
+        assert _request("POST", "/api/job/nope/transcript/word",
+                        {"start": 20.0, "end": 20.4, "text": "x"}).status_code == 404

@@ -10,6 +10,14 @@
 - `POST /api/hook`: add text hook overlays.
 - `POST /api/translate`: AI voice dubbing via ElevenLabs.
 - `GET /api/translate/languages`: supported dubbing languages.
+- `POST /api/voiceover`: speak your own script with an ElevenLabs voice over a clip
+  (`translated_vo_<file>`; `original_audio` duck / mix / replace). `POST
+  /api/voiceover/upload` mixes an uploaded audio file the same way (multipart,
+  50 MB, cut at the clip's end; optional `placements`, one
+  `0:00-0:05 -> 0:05-0:10` per line, puts parts of the track at chosen clip times). `GET /api/voiceover/voices` lists the key's voices.
+- `POST /api/audio-mix`: standalone mixer (Audio Mix tab). Multipart `video` + `audio`
+  (+ `placements`, `original_audio`), answers with the mixed mp4 itself; no job, both
+  uploads and the result are removed once it is sent. Cloud: signed-in only.
 - `POST /api/social/post`: post to social media (async upload). Cloud posts
   through one managed Upload-Post account, one `os_<hex>` profile per user,
   created only by `/api/social/connect` (reads never create it). Capped at
@@ -135,7 +143,7 @@ pulled back to this host to play one file. It happens only when:
 - no re-archive of the job is in flight (`hold` / `forget` around
   `_archive_clip_edit_bg`) and the local copy, if there is one, has the size
   the row recorded. Some edits reuse a file name (`edited_<file>`,
-  `translated_<lang>_<file>`), so the link also carries the size and the
+  `translated_<lang>_<file>`, `translated_vo_<file>`), so the link also carries the size and the
   local file's time as `?v=`, or the edge cache would keep the old object.
 
 The dashboard's download button asks `GET /api/media-url?job_id=&filename=`

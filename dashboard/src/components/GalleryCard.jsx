@@ -55,7 +55,15 @@ export default function GalleryCard({ clip }) {
             const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
-            a.download = `clip_${clip.job_id}_${clip.index + 1}.mp4`;
+            const rawTitle = clip.title || clip.video_title_for_youtube_short || '';
+            const cleanTitle = rawTitle
+                .replace(/[\\/:*?"<>|]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 100)
+                .replace(/[. ]+$/, '');
+            const num = (clip.index ?? 0) + 1;
+            a.download = cleanTitle ? `${num} ${cleanTitle}.mp4` : `clip_${clip.job_id}_${num}.mp4`;
             document.body.appendChild(a);
             a.click();
             window.URL.revokeObjectURL(url);

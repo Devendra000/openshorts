@@ -303,6 +303,19 @@ async def archive_job(user_id, job_id, clips, output_dir, attestation=None):
     print(f"☁️  Archived {len(uploaded)} clip(s) to R2 for user {user_id}.")
 
 
+async def archive_metadata(user_id, job_id, output_dir):
+    """Refresh only the job's metadata JSON in R2, for an edit that changes no
+    clip file (a transcript word fix), so a restored project keeps it."""
+    if not settings.r2_configured or not user_id:
+        return
+    meta_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not meta_files:
+        return
+    key = storage.job_key(user_id, job_id, os.path.basename(meta_files[0]))
+    await asyncio.to_thread(storage.upload_file, meta_files[0], key,
+                            "application/json")
+
+
 async def archive_clip_edit(user_id, job_id, clip_index, output_dir, new_filename):
     """Re-archive one clip after a server-side edit (subtitles/hook/effects/dub).
 

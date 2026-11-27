@@ -29,6 +29,9 @@ TOOL_PATHS = {
     "/api/subtitle/remove": "subtitles_remove",
     "/api/hook": "hook",
     "/api/translate": "translate",
+    "/api/voiceover": "voiceover",
+    "/api/voiceover/upload": "audio_upload",
+    "/api/audio-mix": "audio_mix",
     "/api/effects/generate": "effects",
 }
 SOCIAL_POST_PATH = "/api/social/post"

@@ -34,6 +34,9 @@ dashboard/node_modules/
 *.mkv
 *.gif
 videos/
+# Job data (mounted at runtime by compose; created empty in the image)
+output/
+uploads/
 
 # Model files (downloaded at build time)
 *.pt

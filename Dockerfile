@@ -50,6 +50,28 @@ RUN if [ "$GPU" = "1" ]; then LOCK=requirements-gpu.lock; else LOCK=requirements
  && pip check \
  && pip install --no-index --no-deps -q -r requirements.txt -r requirements-billing.txt
 
+# WhisperX (TRANSCRIBE_BACKEND=whisperx, whisperx_backend.py), only with
+# --build-arg WHISPERX=1. It gets its own venv: its torch / pyannote stack does
+# not fit next to the app's, and the app only runs it as a subprocess
+# (WHISPERX_BIN=/opt/whisperx/bin/whisperx). Same base image as the final
+# stage, so the venv's python symlink resolves there. CPU builds take torch
+# from PyTorch's CPU index first so pip does not pull the CUDA wheels.
+FROM python:3.11-slim@sha256:65bd3d9f1d7fa268dd1909973ba7eb4bdf41f6dcf2cfbe76ba9528b170f3fd79 AS whisperx
+ARG GPU=0
+ARG WHISPERX=0
+RUN mkdir -p /opt/whisperx && if [ "$WHISPERX" = "1" ]; then \
+      python -m venv /opt/whisperx \
+      && /opt/whisperx/bin/pip install --no-cache-dir pip==26.3 \
+      && if [ "$GPU" != "1" ]; then \
+           /opt/whisperx/bin/pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+             torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0; \
+         fi \
+      && /opt/whisperx/bin/pip install --no-cache-dir whisperx==3.8.6 \
+      && /opt/whisperx/bin/python -m nltk.downloader -q -d /opt/whisperx/nltk_data punkt_tab \
+      && /opt/whisperx/bin/whisperx --help > /dev/null \
+      && /opt/whisperx/bin/python -c "import whisperx.alignment"; \
+    fi
+
 # osrender (osrender/, Rust): renders a reframed clip in one pass on the GPU
 # (gpu_render.py). Only GPU builds compile it; the CPU image ships without it
 # and renders through ffmpeg. It links the same Debian FFmpeg libraries the
@@ -113,6 +135,8 @@ ENV BGUTIL_SCRIPT_PATH=/opt/bgutil-provider/server/build/generate_once.js
 COPY --from=builder /opt/venv /opt/venv
 # Empty on CPU builds.
 COPY --from=osrender /out/ /usr/local/bin/
+# Empty unless built with WHISPERX=1.
+COPY --from=whisperx /opt/whisperx /opt/whisperx
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 
@@ -148,9 +172,11 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuse
 # Create directories including Ultralytics cache config. /app/.cache/huggingface
 # exists in-image (appuser-owned via the chown below) so a persistent volume
 # mounted there inherits writable ownership for the ASR model downloads.
-RUN mkdir -p /app/uploads /app/output /app/.cache/huggingface /tmp/Ultralytics
+# /opt/whisperx-cache holds WhisperX's model downloads (WHISPERX_CACHE_DIR);
+# outside /app so a volume there is not hidden by a bind mount of the code.
+RUN mkdir -p /app/uploads /app/output /app/.cache/huggingface /tmp/Ultralytics /opt/whisperx-cache
 # Fix permissions: /app for code/uploads, /tmp/Ultralytics for AI cache
-RUN chown -R appuser:appuser /app /tmp/Ultralytics
+RUN chown -R appuser:appuser /app /tmp/Ultralytics /opt/whisperx-cache
 
 # Switch to non-root user
 USER appuser
@@ -180,7 +206,7 @@ EXPOSE 8000
 # HEALTHCHECK with its own curl/wget command, and an image without either
 # reports unhealthy forever and every deploy rolls back (2026-08-25).
 HEALTHCHECK --interval=5s --timeout=3s --start-period=30s --retries=2 \
-  CMD curl -sf http://127.0.0.1:8000/health/ready > /dev/null || exit 1
+  CMD curl -sf http://127.0.0.1:${PORT:-8000}/health/ready > /dev/null || exit 1
 
 # serve.py starts uvicorn with exactly those flags: one process by default,
 # or (API_FRONT_WORKERS=N) an engine on a local socket plus N front processes
