@@ -1389,7 +1389,21 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
                                             step="0.05"
                                             min="0"
                                             value={timingDraft.start}
-                                            onChange={(e) => setTimingDraft((p) => ({ ...p, start: e.target.value }))}
+                                            onChange={(e) => {
+                                                const raw = e.target.value;
+                                                const nextStart = parseFloat(raw);
+                                                setTimingDraft((p) => {
+                                                    const curStart = parseFloat(p.start);
+                                                    const curEnd = parseFloat(p.end);
+                                                    const dur = Number.isFinite(curStart) && Number.isFinite(curEnd) && curEnd > curStart
+                                                        ? curEnd - curStart
+                                                        : Math.max(0.1, (selectedWord.e - selectedWord.s) || 0.25);
+                                                    const nextEnd = Number.isFinite(nextStart)
+                                                        ? (nextStart + dur).toFixed(2)
+                                                        : p.end;
+                                                    return { ...p, start: raw, end: nextEnd };
+                                                });
+                                            }}
                                             aria-label="word start seconds"
                                             className="input-field text-xs py-1 px-2 w-20 tabular-nums"
                                         />
