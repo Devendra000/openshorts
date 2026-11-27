@@ -991,6 +991,18 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
         }
     };
 
+    const findSentenceEnd = (word) => {
+        if (!word || !words.length) return null;
+        const idx = words.findIndex((w) => w.s === word.s && w.e === word.e);
+        if (idx === -1) return null;
+        for (let i = idx; i < words.length; i++) {
+            if (/[.!?]["')\]]*$/.test((words[i].w || '').trim())) {
+                return words[i];
+            }
+        }
+        return words[words.length - 1];
+    };
+
     const saveTimingFix = async () => {
         if (!selectedWord || !timingDraft) return;
         const newStart = parseFloat(timingDraft.start);
@@ -999,6 +1011,11 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
             setWordError('end must be > start');
             return;
         }
+        const scope = timingDraft.scope || 'sentence';
+        const shiftFollowing = scope !== 'word';
+        const sentenceEndWord = scope === 'sentence' ? findSentenceEnd(selectedWord) : null;
+        const shiftUntilEnd = sentenceEndWord ? sentenceEndWord.e : null;
+
         setWordSaving(true);
         setWordError(null);
         try {
@@ -1010,7 +1027,8 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
                     end: selectedWord.e,
                     new_start: newStart,
                     new_end: newEnd,
-                    shift_following: Boolean(timingDraft.shiftFollowing),
+                    shift_following: shiftFollowing,
+                    shift_until_end: shiftUntilEnd,
                 }),
             });
             const fixed = data.word;
@@ -1020,7 +1038,8 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
                 const hitIdx = prev.words.findIndex((w) => w.s === selectedWord.s && w.e === selectedWord.e);
                 const nextWords = prev.words.map((w, idx) => {
                     if (idx === hitIdx) return { ...w, s: fixed.s, e: fixed.e };
-                    if (timingDraft.shiftFollowing && hitIdx !== -1 && idx > hitIdx && delta !== 0) {
+                    if (shiftFollowing && hitIdx !== -1 && idx > hitIdx && delta !== 0) {
+                        if (shiftUntilEnd !== null && w.s > shiftUntilEnd + 0.002) return w;
                         const s = Math.max(0, Number((w.s + delta).toFixed(3)));
                         const e = Math.max(s + 0.01, Number((w.e + delta).toFixed(3)));
                         return { ...w, s, e };
@@ -1399,15 +1418,21 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
                                         >
                                             @ playhead
                                         </button>
-                                        <label className="flex items-center gap-1 text-[11px] text-ink2 cursor-pointer select-none px-1" title="Shift all words after this one by the same time offset">
-                                            <input
-                                                type="checkbox"
-                                                checked={timingDraft.shiftFollowing}
-                                                onChange={(e) => setTimingDraft((p) => ({ ...p, shiftFollowing: e.target.checked }))}
-                                                className="accent-[var(--color-accent)]"
-                                            />
-                                            <span>shift rest</span>
-                                        </label>
+                                        <select
+                                            value={timingDraft.scope || 'sentence'}
+                                            onChange={(e) => setTimingDraft((p) => ({ ...p, scope: e.target.value }))}
+                                            aria-label="shift scope"
+                                            className="input-field text-[11px] py-1 px-2 bg-paper2 cursor-pointer"
+                                        >
+                                            <option value="sentence">
+                                                {(() => {
+                                                    const endW = findSentenceEnd(selectedWord);
+                                                    return endW ? `this sentence (→ "${endW.w}")` : 'this sentence';
+                                                })()}
+                                            </option>
+                                            <option value="word">this word only</option>
+                                            <option value="all">all following</option>
+                                        </select>
                                         <button type="submit" disabled={wordSaving}
                                             className="btn-quiet text-[11px] py-1 px-2 disabled:opacity-40">
                                             {wordSaving ? 'saving…' : 'save'}
@@ -1434,7 +1459,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
                                                 setTimingDraft({
                                                     start: Number(selectedWord.s).toFixed(2),
                                                     end: Number(selectedWord.e).toFixed(2),
-                                                    shiftFollowing: true,
+                                                    scope: 'sentence',
                                                 });
                                             }}
                                             title={`Adjust when "${selectedWord.w}" (and optionally the rest) appears`}

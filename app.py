@@ -7816,7 +7816,7 @@ _scenes_locks: Dict[str, asyncio.Lock] = {}
 
 class TranscriptWordFix(BaseModel):
     """Correct what one transcript word says or adjust its source-absolute
-    timestamps (optionally shifting all following words by the same delta).
+    timestamps (optionally shifting following words, bounded by shift_until_end).
     The word is named by its current source-absolute start/end."""
     start: float
     end: float
@@ -7824,6 +7824,7 @@ class TranscriptWordFix(BaseModel):
     new_start: Optional[float] = None
     new_end: Optional[float] = None
     shift_following: bool = False
+    shift_until_end: Optional[float] = None
 
 
 # Two decimals of float noise between the edl's words and the stored ones.
@@ -7896,14 +7897,21 @@ async def fix_transcript_word(job_id: str, req: TranscriptWordFix, request: Requ
                     w['end'] = round(ne, 3)
 
                     if req.shift_following and abs(shifted_delta) > 0:
+                        stop_shifting = False
                         for s_i in range(seg_idx, len(segments)):
+                            if stop_shifting:
+                                break
                             s_obj = segments[s_i]
                             s_words = s_obj.get('words') or []
                             start_k = word_idx + 1 if s_i == seg_idx else 0
                             for k in range(start_k, len(s_words)):
                                 ow = s_words[k]
                                 try:
-                                    os_t = max(0.0, round(float(ow['start']) + shifted_delta, 3))
+                                    orig_s = float(ow['start'])
+                                    if req.shift_until_end is not None and orig_s > req.shift_until_end + _WORD_MATCH_SECONDS:
+                                        stop_shifting = True
+                                        break
+                                    os_t = max(0.0, round(orig_s + shifted_delta, 3))
                                     oe_t = max(os_t + 0.01, round(float(ow['end']) + shifted_delta, 3))
                                     ow['start'] = os_t
                                     ow['end'] = oe_t
