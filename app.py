@@ -7636,6 +7636,20 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
 
     clip_data = clips[clip_index]
 
+    if clip_data.get('caption_words'):
+        cw = clip_data['caption_words']
+        recipe_segments = (clip_data.get('recipe') or {}).get('segments')
+        duration_sec = (
+            recut.total_duration(recipe_segments)
+            if recipe_segments
+            else max(0.0, float(clip_data.get('end', 0)) - float(clip_data.get('start', 0)))
+        )
+        return {
+            "captions": cw,
+            "durationSec": duration_sec,
+            "language": transcript.get('language', 'en'),
+        }
+
     # Recut clips are concatenations of source segments; remap the transcript
     # onto the clip timeline so every consumer keeps its flat start..end logic.
     recipe_segments = (clip_data.get('recipe') or {}).get('segments')
@@ -7663,6 +7677,72 @@ async def get_clip_transcript(job_id: str, clip_index: int, request: Request):
         "captions": captions,
         "durationSec": duration_sec,
         "language": transcript.get('language', 'en'),
+    }
+
+
+@app.post("/api/clip/{job_id}/{clip_index}/retranscribe")
+async def retranscribe_clip(job_id: str, clip_index: int, request: Request):
+    """Run fresh AI speech-to-text on ONLY this clip's video file and store
+    the resulting word timestamps as the clip's caption_words."""
+    await _ensure_job_files(job_id, request)
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, jobs[job_id])
+
+    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+
+    with open(json_files[0], 'r') as f:
+        data = json.load(f)
+    clips = data.get('shorts', [])
+    if clip_index < 0 or clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    clip_data = clips[clip_index]
+    video_url = clip_data.get('video_url') or ''
+    filename = os.path.basename(video_url.split('?')[0])
+    clip_path = os.path.join(output_dir, filename) if filename else ''
+    if not clip_path or not os.path.exists(clip_path):
+        raise HTTPException(status_code=404, detail="Clip video file not found")
+
+    import transcribe_backends
+    loop = asyncio.get_event_loop()
+    try:
+        fresh = await loop.run_in_executor(None, transcribe_backends.transcribe_media, clip_path)
+    except transcribe_backends.NoAudioError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        await loop.run_in_executor(None, transcribe_backends.release_models)
+
+    captions = []
+    for segment in (fresh or {}).get('segments', []):
+        for word_info in segment.get('words', []):
+            text = str(word_info.get('word', '')).strip()
+            if not text:
+                continue
+            start_ms = max(0, int(round(float(word_info['start']) * 1000)))
+            end_ms = max(start_ms + 10, int(round(float(word_info['end']) * 1000)))
+            captions.append({"text": text, "startMs": start_ms, "endMs": end_ms})
+
+    if not captions:
+        raise HTTPException(status_code=400, detail="No speech detected in this clip.")
+
+    lock = _rerender_locks.setdefault(job_id, asyncio.Lock())
+    async with lock:
+        with open(json_files[0], 'r') as f:
+            latest = json.load(f)
+        latest_clips = latest.get('shorts', [])
+        if clip_index < len(latest_clips):
+            latest_clips[clip_index]['caption_words'] = captions
+            write_json_atomic(json_files[0], latest, indent=2)
+            _archive_metadata_bg(job_id)
+
+    return {
+        "success": True,
+        "captions": captions,
+        "language": (fresh or {}).get('language', 'en'),
     }
 
 

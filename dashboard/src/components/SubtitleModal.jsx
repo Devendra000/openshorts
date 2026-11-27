@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Loader2 } from 'lucide-react';
+import { Loader2, Sparkles } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import { retimeWords } from '../lib/retimeWords';
 import RemotionPreview from './RemotionPreview';
@@ -130,6 +130,9 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const [bgOpacity, setBgOpacity] = useState(0.0);
     const [animation, setAnimationState] = useState('pop');
     const [showTextEditor, setShowTextEditor] = useState(false);
+    const [retranscribing, setRetranscribing] = useState(false);
+    const [retranscribeError, setRetranscribeError] = useState('');
+    const [retranscribed, setRetranscribed] = useState(false);
 
     // Karaoke (server-side ASS burn) state
     const [style, setStyle] = useState('karaoke'); // classic | karaoke
@@ -203,6 +206,31 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const handleTextEdit = (newText) => {
         setEditableText(newText);
         setCaptions(retimeWords(originalCaptions, newText));
+    };
+
+    const handleRetranscribe = async () => {
+        if (!jobId || clipIndex === undefined || retranscribing) return;
+        setRetranscribing(true);
+        setRetranscribeError('');
+        try {
+            const res = await apiFetch(`/api/clip/${jobId}/${clipIndex}/retranscribe`, {
+                method: 'POST',
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(data.detail || 'Could not re-transcribe this clip.');
+            }
+            const next = Array.isArray(data.captions) ? data.captions : [];
+            setCaptions(next);
+            setOriginalCaptions(next);
+            setEditableText(next.map((c) => c.text).join(' '));
+            setUseRemotionPreview(next.length > 0);
+            setRetranscribed(true);
+        } catch (e) {
+            setRetranscribeError(e.message || 'Could not re-transcribe this clip.');
+        } finally {
+            setRetranscribing(false);
+        }
     };
 
     if (!isOpen) return null;
@@ -399,29 +427,48 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             />
                         </div>
 
-                        {/* Editable Transcript (collapsible) */}
-                        {useRemotionPreview && (
-                            <div>
+                        {/* Re-transcribe only this clip + Editable Transcript */}
+                        <div className="space-y-2">
+                            <div className="flex items-center justify-between gap-2">
+                                <span className="eyebrow">Clip transcript</span>
                                 <button
                                     type="button"
-                                    onClick={() => setShowTextEditor(!showTextEditor)}
-                                    className="w-full flex items-center justify-between mb-2"
+                                    onClick={handleRetranscribe}
+                                    disabled={retranscribing || isProcessing}
+                                    className="btn-ghost px-2.5 py-1 text-[11px] shrink-0"
+                                    title="Run AI speech-to-text on only this clip to re-sync all words"
                                 >
-                                    <span className="eyebrow">Edit text ({captions.length} words)</span>
-                                    <span className={`text-muted transition-transform ${showTextEditor ? 'rotate-180' : ''}`}>▾</span>
+                                    {retranscribing
+                                        ? <><Loader2 size={12} className="animate-spin text-brass" /> transcribing…</>
+                                        : <><Sparkles size={12} className="text-brass" /> re-transcribe clip (AI)</>}
                                 </button>
-                                {showTextEditor && (
-                                    <textarea
-                                        value={editableText}
-                                        onChange={(e) => handleTextEdit(e.target.value)}
-                                        rows={5}
-                                        dir="auto"
-                                        className="input-field resize-none leading-relaxed animate-fade"
-                                        placeholder="Edit subtitle text..."
-                                    />
-                                )}
                             </div>
-                        )}
+                            {retranscribeError && (
+                                <p className="text-xs text-danger">{retranscribeError}</p>
+                            )}
+                            {useRemotionPreview && (
+                                <div>
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowTextEditor(!showTextEditor)}
+                                        className="w-full flex items-center justify-between mb-2"
+                                    >
+                                        <span className="eyebrow">Edit text ({captions.length} words)</span>
+                                        <span className={`text-muted transition-transform ${showTextEditor ? 'rotate-180' : ''}`}>▾</span>
+                                    </button>
+                                    {showTextEditor && (
+                                        <textarea
+                                            value={editableText}
+                                            onChange={(e) => handleTextEdit(e.target.value)}
+                                            rows={5}
+                                            dir="auto"
+                                            className="input-field resize-none leading-relaxed animate-fade"
+                                            placeholder="Edit subtitle text..."
+                                        />
+                                    )}
+                                </div>
+                            )}
+                        </div>
 
                         {/* Font Family */}
                         <div>
@@ -539,8 +586,8 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             // Text edits must survive the server render path too
                             // (issue #69): send the edited words whenever the text
                             // differs from what the transcript produced.
-                            const textEdited = originalCaptions.length > 0
-                                && editableText.trim() !== originalCaptions.map((c) => c.text).join(' ').trim();
+                            const textEdited = retranscribed || (originalCaptions.length > 0
+                                && editableText.trim() !== originalCaptions.map((c) => c.text).join(' ').trim());
                             const styleOptions = {
                                 position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity,
                                 // Karaoke burn (server-side ASS render)
