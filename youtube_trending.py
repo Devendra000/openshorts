@@ -50,6 +50,7 @@ CATEGORIES: dict[str, dict[str, str]] = {
     "music": {"label": "Music", "bp": "4gINGgt5dG1hX2NoYXJ0cw%3D%3D", "yt_cat_id": "10", "search_hint": "trending music"},
     "gaming": {"label": "Gaming", "bp": "4gIcGhpnYW1pbmdfY29ycHVzX21vc3RfcG9wdWxhcg%3D%3D", "yt_cat_id": "20", "search_hint": "trending gaming"},
     "news": {"label": "News", "bp": "4gIOGg5uZXdzX21haW5fZmVlZA%3D%3D", "yt_cat_id": "25", "search_hint": "breaking news today"},
+    "celebrity": {"label": "Celebrity & Viral", "bp": "", "yt_cat_id": "24", "search_hint": "celebrity news viral moments today"},
     "movies": {"label": "Movies", "bp": "4gIKGgh0cmFpbGVycw%3D%3D", "yt_cat_id": "30", "search_hint": "new movie trailers"},
     "shorts": {"label": "Shorts", "bp": "", "yt_cat_id": "", "search_hint": "viral youtube shorts"},
 }
@@ -477,9 +478,10 @@ def fetch_trending_or_search(
                 url = f"https://www.youtube.com/results?search_query={quote_plus(q_clean)}&gl={region}"
                 if sp:
                     url += f"&sp={sp}"
-            elif category == "shorts":
+            elif category in ("shorts", "celebrity"):
                 source = "youtube_search"
-                url = f"https://www.youtube.com/results?search_query={quote_plus('trending shorts')}&gl={region}&sp=CAI%253D"
+                hint = CATEGORIES[category]["search_hint"]
+                url = f"https://www.youtube.com/results?search_query={quote_plus(hint)}&gl={region}&sp=CAI%253D"
             else:
                 source = "youtube_feed"
                 bp = CATEGORIES[category]["bp"]

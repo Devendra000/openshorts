@@ -34,6 +34,7 @@ const REGIONS = [
 
 const CATEGORIES = [
   { id: 'all', label: 'All Trending' },
+  { id: 'celebrity', label: 'Celebrity & Viral' },
   { id: 'music', label: 'Music' },
   { id: 'gaming', label: 'Gaming' },
   { id: 'news', label: 'News' },
@@ -48,13 +49,14 @@ const SORTS = [
 ];
 
 const QUICK_TOPICS = [
-  'AI & Tech',
+  'Celebrity News',
+  'Viral Moments',
+  'Pop Culture',
   'Podcasts',
-  'Creator Economy',
+  'AI & Tech',
   'Gaming',
   'Finance',
   'Fitness',
-  'Coding',
 ];
 
 export default function TrendingTab({ onClipUrl }) {
@@ -140,16 +142,29 @@ export default function TrendingTab({ onClipUrl }) {
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => loadTrending()}
-          disabled={loading}
-          className="btn-ghost px-3 py-2 text-xs shrink-0"
-          title="Refresh results"
-        >
-          <RefreshCw size={14} className={loading ? 'animate-spin text-brass' : ''} />
-          <span>{loading ? 'fetching…' : 'refresh'}</span>
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          <a
+            href="https://trendreport.com/trends/entertainment/"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn-ghost px-3 py-2 text-xs"
+            title="Open Trend Report Entertainment in a new tab"
+          >
+            <ExternalLink size={14} />
+            <span>trend report</span>
+          </a>
+
+          <button
+            type="button"
+            onClick={() => loadTrending()}
+            disabled={loading}
+            className="btn-ghost px-3 py-2 text-xs"
+            title="Refresh results"
+          >
+            <RefreshCw size={14} className={loading ? 'animate-spin text-brass' : ''} />
+            <span>{loading ? 'fetching…' : 'refresh'}</span>
+          </button>
+        </div>
       </div>
 
       {/* Search & Filters */}
