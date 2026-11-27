@@ -130,6 +130,10 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     const [bgOpacity, setBgOpacity] = useState(0.0);
     const [animation, setAnimationState] = useState('pop');
     const [showTextEditor, setShowTextEditor] = useState(false);
+    const [showWordFixer, setShowWordFixer] = useState(false);
+    const [selectedWordIdx, setSelectedWordIdx] = useState(null);
+    const [wordFixDraft, setWordFixDraft] = useState(null); // { text, start, end, scope }
+    const [wordsModified, setWordsModified] = useState(false);
     const [retranscribing, setRetranscribing] = useState(false);
     const [retranscribeError, setRetranscribeError] = useState('');
     const [retranscribed, setRetranscribed] = useState(false);
@@ -226,11 +230,66 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             setEditableText(next.map((c) => c.text).join(' '));
             setUseRemotionPreview(next.length > 0);
             setRetranscribed(true);
+            setSelectedWordIdx(null);
+            setWordFixDraft(null);
         } catch (e) {
             setRetranscribeError(e.message || 'Could not re-transcribe this clip.');
         } finally {
             setRetranscribing(false);
         }
+    };
+
+    const selectWordForFix = (idx) => {
+        const w = captions[idx];
+        if (!w) return;
+        setSelectedWordIdx(idx);
+        setWordFixDraft({
+            text: w.text,
+            start: (w.startMs / 1000).toFixed(2),
+            end: (w.endMs / 1000).toFixed(2),
+            scope: 'sentence',
+        });
+    };
+
+    const findSentenceEndIdx = (idx) => {
+        for (let i = idx; i < captions.length; i++) {
+            if (/[.!?]["')\]]*$/.test((captions[i].text || '').trim())) return i;
+        }
+        return captions.length - 1;
+    };
+
+    const applyWordFix = () => {
+        if (selectedWordIdx === null || !wordFixDraft) return;
+        const orig = captions[selectedWordIdx];
+        if (!orig) return;
+        const text = (wordFixDraft.text || '').trim();
+        const ns = parseFloat(wordFixDraft.start);
+        const ne = parseFloat(wordFixDraft.end);
+        if (!text || !Number.isFinite(ns) || !Number.isFinite(ne) || ns < 0 || ne <= ns) return;
+
+        const newStartMs = Math.round(ns * 1000);
+        const newEndMs = Math.round(ne * 1000);
+        const deltaMs = newStartMs - orig.startMs;
+        const scope = wordFixDraft.scope || 'sentence';
+        const endIdx = scope === 'sentence' ? findSentenceEndIdx(selectedWordIdx)
+            : scope === 'all' ? captions.length - 1
+            : selectedWordIdx;
+
+        const next = captions.map((c, i) => {
+            if (i === selectedWordIdx) return { ...c, text, startMs: newStartMs, endMs: newEndMs };
+            if (i > selectedWordIdx && i <= endIdx && deltaMs !== 0) {
+                const s = Math.max(0, c.startMs + deltaMs);
+                const e = Math.max(s + 10, c.endMs + deltaMs);
+                return { ...c, startMs: s, endMs: e };
+            }
+            return c;
+        }).sort((a, b) => a.startMs - b.startMs);
+
+        setCaptions(next);
+        setEditableText(next.map((c) => c.text).join(' '));
+        setWordsModified(true);
+        setSelectedWordIdx(null);
+        setWordFixDraft(null);
     };
 
     if (!isOpen) return null;
@@ -447,13 +506,110 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                 <p className="text-xs text-danger">{retranscribeError}</p>
                             )}
                             {useRemotionPreview && (
-                                <div>
+                                <div className="space-y-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => setShowWordFixer(!showWordFixer)}
+                                        className="w-full flex items-center justify-between"
+                                    >
+                                        <span className="eyebrow">Fix word &amp; timing ({captions.length} words)</span>
+                                        <span className={`text-muted transition-transform ${showWordFixer ? 'rotate-180' : ''}`}>▾</span>
+                                    </button>
+                                    {showWordFixer && (
+                                        <div className="space-y-2 p-2.5 rounded-input bg-paper2 border border-rule animate-fade">
+                                            {wordFixDraft && selectedWordIdx !== null && (
+                                                <div className="space-y-2 pb-2 border-b border-rule">
+                                                    <div className="flex flex-wrap items-center gap-1.5">
+                                                        <input
+                                                            type="text"
+                                                            value={wordFixDraft.text}
+                                                            onChange={(e) => setWordFixDraft((p) => ({ ...p, text: e.target.value }))}
+                                                            className="input-field text-xs py-1 px-2 w-28"
+                                                            aria-label="Word text"
+                                                        />
+                                                        <input
+                                                            type="number"
+                                                            step="0.05"
+                                                            min="0"
+                                                            value={wordFixDraft.start}
+                                                            onChange={(e) => {
+                                                                const raw = e.target.value;
+                                                                const nextStart = parseFloat(raw);
+                                                                setWordFixDraft((p) => {
+                                                                    const cs = parseFloat(p.start);
+                                                                    const ce = parseFloat(p.end);
+                                                                    const dur = Number.isFinite(cs) && Number.isFinite(ce) && ce > cs ? ce - cs : 0.25;
+                                                                    const nextEnd = Number.isFinite(nextStart) ? (nextStart + dur).toFixed(2) : p.end;
+                                                                    return { ...p, start: raw, end: nextEnd };
+                                                                });
+                                                            }}
+                                                            className="input-field text-xs py-1 px-2 w-20 tabular-nums"
+                                                            aria-label="Start seconds"
+                                                        />
+                                                        <span className="text-xs text-muted">→</span>
+                                                        <input
+                                                            type="number"
+                                                            step="0.05"
+                                                            min="0"
+                                                            value={wordFixDraft.end}
+                                                            onChange={(e) => setWordFixDraft((p) => ({ ...p, end: e.target.value }))}
+                                                            className="input-field text-xs py-1 px-2 w-20 tabular-nums"
+                                                            aria-label="End seconds"
+                                                        />
+                                                    </div>
+                                                    <div className="flex flex-wrap items-center gap-1.5">
+                                                        <select
+                                                            value={wordFixDraft.scope}
+                                                            onChange={(e) => setWordFixDraft((p) => ({ ...p, scope: e.target.value }))}
+                                                            className="input-field text-[11px] py-1 px-2 bg-paper3 flex-1"
+                                                        >
+                                                            <option value="sentence">this sentence</option>
+                                                            <option value="word">this word only</option>
+                                                            <option value="all">all following</option>
+                                                        </select>
+                                                        <button
+                                                            type="button"
+                                                            onClick={applyWordFix}
+                                                            className="btn-primary text-[11px] py-1 px-2.5"
+                                                        >
+                                                            update
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => { setSelectedWordIdx(null); setWordFixDraft(null); }}
+                                                            className="btn-ghost text-[11px] py-1 px-2"
+                                                        >
+                                                            cancel
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            )}
+                                            <div className="max-h-36 overflow-y-auto custom-scrollbar flex flex-wrap gap-1">
+                                                {captions.map((w, idx) => (
+                                                    <button
+                                                        key={`${idx}-${w.startMs}`}
+                                                        type="button"
+                                                        onClick={() => selectWordForFix(idx)}
+                                                        title={`${(w.startMs / 1000).toFixed(2)}s → ${(w.endMs / 1000).toFixed(2)}s`}
+                                                        className={`px-1.5 py-0.5 rounded text-xs transition-colors ${
+                                                            selectedWordIdx === idx
+                                                                ? 'bg-brass text-brassink font-medium'
+                                                                : 'bg-paper3 text-ink2 hover:text-ink'
+                                                        }`}
+                                                    >
+                                                        {w.text}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+
                                     <button
                                         type="button"
                                         onClick={() => setShowTextEditor(!showTextEditor)}
                                         className="w-full flex items-center justify-between mb-2"
                                     >
-                                        <span className="eyebrow">Edit text ({captions.length} words)</span>
+                                        <span className="eyebrow">Edit all text</span>
                                         <span className={`text-muted transition-transform ${showTextEditor ? 'rotate-180' : ''}`}>▾</span>
                                     </button>
                                     {showTextEditor && (
@@ -586,7 +742,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                             // Text edits must survive the server render path too
                             // (issue #69): send the edited words whenever the text
                             // differs from what the transcript produced.
-                            const textEdited = retranscribed || (originalCaptions.length > 0
+                            const textEdited = retranscribed || wordsModified || (originalCaptions.length > 0
                                 && editableText.trim() !== originalCaptions.map((c) => c.text).join(' ').trim());
                             const styleOptions = {
                                 position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity,
