@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket, Music } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket, Music, Flame } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
@@ -10,6 +10,7 @@ import { clipProgress, FREE_CLIPS_PER_VIDEO, FREE_CLIPS_QUIET, MAX_CLIPS_PER_VID
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
 import AudioMixTab from './components/AudioMixTab';
+import TrendingTab from './components/TrendingTab';
 import UGCGallery from './components/UGCGallery';
 import ScheduleWeekModal from './components/ScheduleWeekModal';
 import ClipEditor from './components/ClipEditor';
@@ -410,6 +411,7 @@ function App() {
   });
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
+  const [prefillUrl, setPrefillUrl] = useState('');
   // Mobile only: the full nav lives in a drawer behind the header's menu button.
   const [navOpen, setNavOpen] = useState(false);
   // Reopened-project state (paid mode): per-clip {index, server_file, active_layers}
@@ -1088,7 +1090,7 @@ function App() {
   // dropped so a reload does not keep forcing the tab.
   const [autopilotConnected, setAutopilotConnected] = useState(null); // connect outcome, see lib/connectReturn.js
   useEffect(() => {
-    const DEEP_LINK_TABS = ['autopilot', 'history', 'settings', 'thumbnails', 'dashboard', 'saasshorts', 'audio-mix'];
+    const DEEP_LINK_TABS = ['autopilot', 'history', 'settings', 'thumbnails', 'dashboard', 'saasshorts', 'audio-mix', 'trending'];
     const apply = () => {
       const hash = window.location.hash || '';
       if (!hash.startsWith('#app?')) return;
@@ -1477,8 +1479,9 @@ function App() {
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
     { id: 'audio-mix', ord: '07', icon: Music, label: 'Audio Mix', short: 'audio', isNew: true },
-    ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '08', icon: History, label: 'History', short: 'history' }] : []),
-    { id: 'settings', ord: '09', icon: Settings, label: 'Settings', short: 'settings' },
+    { id: 'trending', ord: '08', icon: Flame, label: 'Trending YouTube', short: 'trending', isNew: true },
+    ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '09', icon: History, label: 'History', short: 'history' }] : []),
+    { id: 'settings', ord: '10', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
 
@@ -2255,6 +2258,16 @@ function App() {
 
           {activeTab === 'audio-mix' && <AudioMixTab />}
 
+          {activeTab === 'trending' && (
+            <TrendingTab
+              onClipUrl={(url) => {
+                setPrefillUrl(url);
+                if (status !== 'idle') handleReset();
+                setActiveTab('dashboard');
+              }}
+            />
+          )}
+
           {activeTab === 'thumbnails' && (
             <ThumbnailStudio
               geminiApiKey={apiKey}
@@ -2307,7 +2320,7 @@ function App() {
                   )}
                 </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} />
+                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing'} prefillUrl={prefillUrl} />
 
                 <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-8 text-muted text-xs sm:text-sm">
                   <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>

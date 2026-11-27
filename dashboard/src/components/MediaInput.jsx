@@ -32,7 +32,7 @@ const readVideoDuration = (file) => new Promise((resolve) => {
     } catch { resolve(null); }
 });
 
-export default function MediaInput({ onProcess, isProcessing }) {
+export default function MediaInput({ onProcess, isProcessing, prefillUrl = '' }) {
     const { plan } = useAuth();
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     // File upload is the primary path; the link is secondary.
@@ -124,6 +124,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
             setUrl(pending);
         }
     }, []);
+
+    useEffect(() => {
+        if (prefillUrl) {
+            setMode('url');
+            setUrl(prefillUrl);
+        }
+    }, [prefillUrl]);
 
     const handleSubmit = (e) => {
         e.preventDefault();

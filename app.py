@@ -4515,6 +4515,9 @@ app.include_router(_mcp_server.router)
 import free_tools as _free_tools
 app.include_router(_free_tools.router)
 
+import youtube_trending as _youtube_trending
+app.include_router(_youtube_trending.router)
+
 # Enable CORS for frontend. Cloud mode locks this down to the configured origins;
 # self-host keeps the permissive wildcard it has always used.
 app.add_middleware(
