@@ -412,6 +412,7 @@ function App() {
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
   const [prefillUrl, setPrefillUrl] = useState('');
+  const [lastJobRequest, setLastJobRequest] = useState(null);
   // Mobile only: the full nav lives in a drawer behind the header's menu button.
   const [navOpen, setNavOpen] = useState(false);
   // Reopened-project state (paid mode): per-clip {index, server_file, active_layers}
@@ -1260,6 +1261,7 @@ function App() {
     }
     // Past every gate, so this request is really running: nothing left to resume.
     clearPendingJob();
+    setLastJobRequest({ data, forceLowQuality });
     setStatus('processing');
     setJobError('');
     setLogs(["Starting process..."]);
@@ -2725,13 +2727,27 @@ function App() {
                     ) : status === 'error' ? (
                       <div className="h-full min-h-[120px] flex flex-col items-center justify-center text-danger space-y-3">
                         <p className="font-medium">Generation failed.</p>
-                        <button
-                          onClick={handleReset}
-                          className="btn-primary text-xs px-4 py-2 text-ink flex items-center gap-1.5"
-                        >
-                          <Plus size={14} />
-                          <span>Start New Project</span>
-                        </button>
+                        {jobError && (
+                          <p className="text-xs text-muted max-w-[34ch] text-center">{jobError}</p>
+                        )}
+                        <div className="flex flex-wrap items-center justify-center gap-2">
+                          {lastJobRequest && (
+                            <button
+                              onClick={() => handleProcess(lastJobRequest.data, lastJobRequest.forceLowQuality)}
+                              className="btn-primary text-xs px-4 py-2 text-ink flex items-center gap-1.5"
+                            >
+                              <RotateCcw size={14} />
+                              <span>Retry</span>
+                            </button>
+                          )}
+                          <button
+                            onClick={handleReset}
+                            className="btn-ghost text-xs px-4 py-2 flex items-center gap-1.5"
+                          >
+                            <Plus size={14} />
+                            <span>Start New Project</span>
+                          </button>
+                        </div>
                       </div>
                     ) : null
                   )}
