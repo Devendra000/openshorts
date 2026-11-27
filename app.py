@@ -7815,12 +7815,15 @@ _scenes_locks: Dict[str, asyncio.Lock] = {}
 
 
 class TranscriptWordFix(BaseModel):
-    """Correct what one transcript word says (a mishearing, "zombie" for "off
-    me"), keeping its timestamps. The word is named by its source-absolute
-    start/end, exactly as GET .../edl lists it."""
+    """Correct what one transcript word says or adjust its source-absolute
+    timestamps (optionally shifting all following words by the same delta).
+    The word is named by its current source-absolute start/end."""
     start: float
     end: float
-    text: str
+    text: Optional[str] = None
+    new_start: Optional[float] = None
+    new_end: Optional[float] = None
+    shift_following: bool = False
 
 
 # Two decimals of float noise between the edl's words and the stored ones.
@@ -7830,18 +7833,22 @@ MAX_WORD_FIX_CHARS = 60
 
 @app.post("/api/job/{job_id}/transcript/word")
 async def fix_transcript_word(job_id: str, req: TranscriptWordFix, request: Request):
-    """Fix the text of one word of the job's source transcript.
+    """Fix the text and/or timestamps of one word of the job's source transcript.
 
     Fixed at the source, every caption made from it afterwards (re-apply
     captions on a recut, subtitle restyles, every clip of the job) says the
     right thing on the right beat, instead of a per-clip caption edit that the
-    next recut throws away. Timestamps never change: the audio did not.
+    next recut throws away.
     """
-    text = " ".join((req.text or "").split())
-    if not text or len(text) > MAX_WORD_FIX_CHARS:
+    text = " ".join((req.text or "").split()) if req.text is not None else None
+    if text is not None and (not text or len(text) > MAX_WORD_FIX_CHARS):
         raise HTTPException(
             status_code=400,
             detail=f"The word must be 1 to {MAX_WORD_FIX_CHARS} characters.")
+    has_timing = req.new_start is not None or req.new_end is not None
+    if text is None and not has_timing:
+        raise HTTPException(status_code=400, detail="Provide text or new timestamps to update.")
+
     await _ensure_job_files(job_id, request)
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -7857,9 +7864,9 @@ async def fix_transcript_word(job_id: str, req: TranscriptWordFix, request: Requ
         with open(json_files[0], 'r') as f:
             data = json.load(f)
         segments = (data.get('transcript') or {}).get('segments') or []
-        for seg in segments:
+        for seg_idx, seg in enumerate(segments):
             words = seg.get('words') or []
-            for w in words:
+            for word_idx, w in enumerate(words):
                 try:
                     hit = (abs(float(w['start']) - req.start) <= _WORD_MATCH_SECONDS
                            and abs(float(w['end']) - req.end) <= _WORD_MATCH_SECONDS)
@@ -7867,15 +7874,65 @@ async def fix_transcript_word(job_id: str, req: TranscriptWordFix, request: Requ
                     continue
                 if not hit:
                     continue
-                # Leading space: Whisper's word-boundary convention, which the
-                # caption block collector relies on.
-                w['word'] = " " + text
-                seg['text'] = " ".join(str(x.get('word', '')).strip() for x in words
-                                       if str(x.get('word', '')).strip())
+
+                if text is not None:
+                    # Leading space: Whisper's word-boundary convention, which the
+                    # caption block collector relies on.
+                    w['word'] = " " + text
+                    seg['text'] = " ".join(str(x.get('word', '')).strip() for x in words
+                                           if str(x.get('word', '')).strip())
+
+                shifted_delta = 0.0
+                if has_timing:
+                    old_start = float(w['start'])
+                    ns = float(req.new_start if req.new_start is not None else w['start'])
+                    ne = float(req.new_end if req.new_end is not None else w['end'])
+                    if ns < 0 or ne <= ns:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="End time must be greater than start time (>= 0).")
+                    shifted_delta = round(ns - old_start, 3)
+                    w['start'] = round(ns, 3)
+                    w['end'] = round(ne, 3)
+
+                    if req.shift_following and abs(shifted_delta) > 0:
+                        for s_i in range(seg_idx, len(segments)):
+                            s_obj = segments[s_i]
+                            s_words = s_obj.get('words') or []
+                            start_k = word_idx + 1 if s_i == seg_idx else 0
+                            for k in range(start_k, len(s_words)):
+                                ow = s_words[k]
+                                try:
+                                    os_t = max(0.0, round(float(ow['start']) + shifted_delta, 3))
+                                    oe_t = max(os_t + 0.01, round(float(ow['end']) + shifted_delta, 3))
+                                    ow['start'] = os_t
+                                    ow['end'] = oe_t
+                                except (KeyError, TypeError, ValueError):
+                                    continue
+                            if s_words:
+                                try:
+                                    s_obj['start'] = float(s_words[0]['start'])
+                                    s_obj['end'] = float(s_words[-1]['end'])
+                                except (KeyError, TypeError, ValueError):
+                                    pass
+                    elif 'start' in seg and 'end' in seg and words:
+                        try:
+                            seg['start'] = min(float(seg['start']), float(words[0]['start']))
+                            seg['end'] = max(float(seg['end']), float(words[-1]['end']))
+                        except (KeyError, TypeError, ValueError):
+                            pass
+
                 write_json_atomic(json_files[0], data, indent=2)
                 _archive_metadata_bg(job_id)
-                return {"success": True,
-                        "word": {"w": text, "s": float(w['start']), "e": float(w['end'])}}
+                return {
+                    "success": True,
+                    "word": {
+                        "w": str(w.get('word', '')).strip(),
+                        "s": float(w['start']),
+                        "e": float(w['end']),
+                    },
+                    "shifted_delta": shifted_delta if req.shift_following else 0.0,
+                }
     raise HTTPException(status_code=404, detail="Word not found in the transcript")
 
 

@@ -115,8 +115,9 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
     const [renderError, setRenderError] = useState(null);
     const [confirmClose, setConfirmClose] = useState(false);
     const [selectedWord, setSelectedWord] = useState(null);
-    // Correcting a misheard word of the source transcript (keeps its timing).
+    // Correcting a misheard word or its timestamps in the source transcript.
     const [wordDraft, setWordDraft] = useState(null); // null = not editing
+    const [timingDraft, setTimingDraft] = useState(null); // null = not editing timing
     const [wordSaving, setWordSaving] = useState(false);
     const [wordError, setWordError] = useState(null);
     // A word was fixed since the last render: the captions on screen are stale.
@@ -990,6 +991,55 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
         }
     };
 
+    const saveTimingFix = async () => {
+        if (!selectedWord || !timingDraft) return;
+        const newStart = parseFloat(timingDraft.start);
+        const newEnd = parseFloat(timingDraft.end);
+        if (!Number.isFinite(newStart) || !Number.isFinite(newEnd) || newStart < 0 || newEnd <= newStart) {
+            setWordError('end must be > start');
+            return;
+        }
+        setWordSaving(true);
+        setWordError(null);
+        try {
+            const data = await apiJson(`/api/job/${jobId}/transcript/word`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    start: selectedWord.s,
+                    end: selectedWord.e,
+                    new_start: newStart,
+                    new_end: newEnd,
+                    shift_following: Boolean(timingDraft.shiftFollowing),
+                }),
+            });
+            const fixed = data.word;
+            const delta = Number(data.shifted_delta || 0);
+            setEdl((prev) => {
+                if (!prev) return prev;
+                const hitIdx = prev.words.findIndex((w) => w.s === selectedWord.s && w.e === selectedWord.e);
+                const nextWords = prev.words.map((w, idx) => {
+                    if (idx === hitIdx) return { ...w, s: fixed.s, e: fixed.e };
+                    if (timingDraft.shiftFollowing && hitIdx !== -1 && idx > hitIdx && delta !== 0) {
+                        const s = Math.max(0, Number((w.s + delta).toFixed(3)));
+                        const e = Math.max(s + 0.01, Number((w.e + delta).toFixed(3)));
+                        return { ...w, s, e };
+                    }
+                    return w;
+                });
+                nextWords.sort((a, b) => a.s - b.s);
+                return { ...prev, words: nextWords };
+            });
+            setSelectedWord((prev) => (prev ? { ...prev, s: fixed.s, e: fixed.e } : prev));
+            setTimingDraft(null);
+            setWordsFixed(true);
+        } catch (e) {
+            setWordError(e.message || 'could not save timing');
+        } finally {
+            setWordSaving(false);
+        }
+    };
+
     // ---- render -------------------------------------------------------------
     if (loadError) {
         return (
@@ -1310,14 +1360,87 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, boundaries, on
                                         </button>
                                         {wordError && <span className="text-[11px] text-red-400 lowercase">{wordError}</span>}
                                     </form>
+                                ) : selectedWord && timingDraft !== null ? (
+                                    <form
+                                        className="flex flex-wrap items-center gap-1.5 shrink-0"
+                                        onSubmit={(e) => { e.preventDefault(); saveTimingFix(); }}
+                                    >
+                                        <input
+                                            type="number"
+                                            step="0.05"
+                                            min="0"
+                                            value={timingDraft.start}
+                                            onChange={(e) => setTimingDraft((p) => ({ ...p, start: e.target.value }))}
+                                            aria-label="word start seconds"
+                                            className="input-field text-xs py-1 px-2 w-20 tabular-nums"
+                                        />
+                                        <span className="text-xs text-muted">→</span>
+                                        <input
+                                            type="number"
+                                            step="0.05"
+                                            min="0"
+                                            value={timingDraft.end}
+                                            onChange={(e) => setTimingDraft((p) => ({ ...p, end: e.target.value }))}
+                                            aria-label="word end seconds"
+                                            className="input-field text-xs py-1 px-2 w-20 tabular-nums"
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                const dur = Math.max(0.1, (selectedWord.e - selectedWord.s) || 0.25);
+                                                setTimingDraft((p) => ({
+                                                    ...p,
+                                                    start: sourceTime.toFixed(2),
+                                                    end: (sourceTime + dur).toFixed(2),
+                                                }));
+                                            }}
+                                            title={`Snap "${selectedWord.w}" to current source playhead (${fmt(sourceTime)})`}
+                                            className="btn-quiet text-[11px] py-1 px-2"
+                                        >
+                                            @ playhead
+                                        </button>
+                                        <label className="flex items-center gap-1 text-[11px] text-ink2 cursor-pointer select-none px-1" title="Shift all words after this one by the same time offset">
+                                            <input
+                                                type="checkbox"
+                                                checked={timingDraft.shiftFollowing}
+                                                onChange={(e) => setTimingDraft((p) => ({ ...p, shiftFollowing: e.target.checked }))}
+                                                className="accent-[var(--color-accent)]"
+                                            />
+                                            <span>shift rest</span>
+                                        </label>
+                                        <button type="submit" disabled={wordSaving}
+                                            className="btn-quiet text-[11px] py-1 px-2 disabled:opacity-40">
+                                            {wordSaving ? 'saving…' : 'save'}
+                                        </button>
+                                        <button type="button" onClick={() => { setTimingDraft(null); setWordError(null); }}
+                                            className="btn-quiet text-[11px] py-1 px-2">
+                                            cancel
+                                        </button>
+                                        {wordError && <span className="text-[11px] text-red-400 lowercase">{wordError}</span>}
+                                    </form>
                                 ) : selectedWord ? (
                                     <div className="flex items-center gap-1.5 shrink-0">
                                         <button
-                                            onClick={() => setWordDraft(selectedWord.w)}
+                                            onClick={() => { setTimingDraft(null); setWordError(null); setWordDraft(selectedWord.w); }}
                                             title={`"${selectedWord.w}" is misheard? Correct the transcript; the timing stays`}
                                             className="btn-quiet text-[11px] py-1 px-2"
                                         >
                                             fix word
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                setWordDraft(null);
+                                                setWordError(null);
+                                                setTimingDraft({
+                                                    start: Number(selectedWord.s).toFixed(2),
+                                                    end: Number(selectedWord.e).toFixed(2),
+                                                    shiftFollowing: true,
+                                                });
+                                            }}
+                                            title={`Adjust when "${selectedWord.w}" (and optionally the rest) appears`}
+                                            className="btn-quiet text-[11px] py-1 px-2"
+                                        >
+                                            fix timing
                                         </button>
                                         <button
                                             onClick={() => setSegment(selected, { start: selectedWord.s }, { snap: false })}
