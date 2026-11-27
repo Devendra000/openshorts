@@ -1479,7 +1479,7 @@ function App() {
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
     { id: 'audio-mix', ord: '07', icon: Music, label: 'Audio Mix', short: 'audio', isNew: true },
-    { id: 'trending', ord: '08', icon: Flame, label: 'Trending YouTube', short: 'trending', isNew: true },
+    { id: 'trending', ord: '08', icon: Flame, label: 'Trending', short: 'trending', isNew: true },
     ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '09', icon: History, label: 'History', short: 'history' }] : []),
     { id: 'settings', ord: '10', icon: Settings, label: 'Settings', short: 'settings' },
   ];

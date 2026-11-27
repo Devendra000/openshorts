@@ -183,7 +183,7 @@ export default function TrendingTab({ onClipUrl }) {
                 value={region}
                 onChange={(e) => setRegion(e.target.value)}
                 aria-label="Region"
-                className="input-field pl-8 pr-7 py-2.5 text-xs bg-paper2 cursor-pointer"
+                className="input-field pl-9 pr-7 py-2.5 text-xs bg-paper2 cursor-pointer w-44"
               >
                 {REGIONS.map((r) => (
                   <option key={r.code} value={r.code}>
